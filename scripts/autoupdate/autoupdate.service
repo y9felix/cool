@@ -1,0 +1,13 @@
+[Unit]
+Description=Daily idle autoupdate and reboot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/autoupdate
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
