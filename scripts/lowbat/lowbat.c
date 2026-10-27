@@ -123,15 +123,15 @@ static void draw_text(uint32_t *px, int W, int H, int cx, int y, const char *s, 
 static void render(uint32_t *px, int W, int H, int cap, int level)
 {
 	int u = ui_scale, b = 3 * u, cx = W / 2;
-	uint32_t accent = level <= LEVEL_CRIT ? 0xFFF38BA8 : 0xFFFAB387;
+	uint32_t accent = level <= LEVEL_CRIT ? 0xFF8000FF : 0xFF7E56C3;
 	char pct[16];
 
 	fill(px, W, H, 0, 0, W, H, accent);
-	fill(px, W, H, b, b, W - 2 * b, H - 2 * b, 0xFF1E1E2E);
-	draw_text(px, W, H, cx, 20 * u, level <= LEVEL_CRIT ? "BATTERY CRITICAL" : "BATTERY LOW", 4 * u, 0xFFCDD6F4);
+	fill(px, W, H, b, b, W - 2 * b, H - 2 * b, 0xFF000000);
+	draw_text(px, W, H, cx, 20 * u, level <= LEVEL_CRIT ? "BATTERY CRITICAL" : "BATTERY LOW", 4 * u, 0xFFFFFFFF);
 	snprintf(pct, sizeof pct, "%d%%", cap);
 	draw_text(px, W, H, cx, 62 * u, pct, 8 * u, accent);
-	draw_text(px, W, H, cx, 132 * u, "PLUG IN CHARGER", 3 * u, 0xFFA6ADC8);
+	draw_text(px, W, H, cx, 132 * u, "PLUG IN CHARGER", 3 * u, 0xFFFFFFFF);
 }
 
 static void noop(void) {}
