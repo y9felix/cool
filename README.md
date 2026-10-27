@@ -1,1 +1,1 @@
-Use C and Lua for everything
+Use C and Bash for everything
