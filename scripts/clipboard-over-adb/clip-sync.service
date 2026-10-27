@@ -1,0 +1,14 @@
+[Unit]
+Description=Android Clipboard Sync Daemon
+After=default.target
+
+[Service]
+Type=simple
+Environment=PATH=/home/felix/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=WAYLAND_DISPLAY=wayland-0
+ExecStart=/usr/local/bin/clip-sync
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
