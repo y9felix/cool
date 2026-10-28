@@ -5,8 +5,10 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
+#include <time.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/signalfd.h>
@@ -18,6 +20,15 @@
 static char *last_clip = NULL;
 static size_t last_clip_len = 0;
 static pid_t wl_paste_pid = -1;
+static uint64_t wl_paste_start_time = 0;
+static uint64_t wl_paste_retry_at_ms = 0;
+static int wl_paste_backoff_ms = 1000;
+
+static uint64_t get_monotonic_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)(ts.tv_nsec / 1000000ULL);
+}
 
 static int is_duplicate(const char *text, size_t len) {
     if (!last_clip || last_clip_len != len) return 0;
@@ -39,6 +50,9 @@ static void wl_copy(const char *data, size_t len) {
     if (pipe(p) < 0) return;
     pid_t pid = fork();
     if (pid == 0) {
+        sigset_t unblock;
+        sigemptyset(&unblock);
+        sigprocmask(SIG_SETMASK, &unblock, NULL);
         close(p[1]);
         dup2(p[0], STDIN_FILENO);
         close(p[0]);
@@ -123,10 +137,16 @@ static void start_wl_paste(const char *self_path) {
     if (wl_paste_pid > 0) return;
     pid_t pid = fork();
     if (pid == 0) {
+        sigset_t unblock;
+        sigemptyset(&unblock);
+        sigprocmask(SIG_SETMASK, &unblock, NULL);
         execlp("wl-paste", "wl-paste", "-t", "text", "-w", self_path, "--push", (char *)NULL);
         _exit(127);
     }
-    wl_paste_pid = pid;
+    if (pid > 0) {
+        wl_paste_pid = pid;
+        wl_paste_start_time = get_monotonic_ms();
+    }
 }
 
 static void stop_wl_paste(void) {
@@ -137,55 +157,126 @@ static void stop_wl_paste(void) {
     }
 }
 
-static int is_any_device_connected(void) {
-    FILE *fp = popen("adb devices", "r");
-    if (!fp) return 0;
-    char line[256];
-    int found = 0;
-    while (fgets(line, sizeof(line), fp)) {
-        if (strstr(line, "\tdevice")) {
-            found = 1;
-            break;
+static int run_cmd(const char *file, char *const argv[]) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        sigset_t unblock;
+        sigemptyset(&unblock);
+        sigprocmask(SIG_SETMASK, &unblock, NULL);
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull >= 0) {
+            dup2(devnull, STDIN_FILENO);
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+            close(devnull);
+        }
+        execvp(file, argv);
+        _exit(127);
+    }
+    if (pid < 0) return -1;
+    int status;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) return -1;
+    }
+    return (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : -1;
+}
+
+static int probe_device(const char *ip, int port) {
+    int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0) return 0;
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    if (inet_pton(AF_INET, ip, &addr.sin_addr) <= 0) {
+        close(fd);
+        return 0;
+    }
+
+    int res = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
+    if (res < 0) {
+        if (errno != EINPROGRESS) {
+            close(fd);
+            return 0;
+        }
+        struct pollfd pfd;
+        pfd.fd = fd;
+        pfd.events = POLLOUT;
+        int ret = poll(&pfd, 1, 300);
+        if (ret <= 0) {
+            close(fd);
+            return 0;
+        }
+        int err = 0;
+        socklen_t len = sizeof(err);
+        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0 || err != 0) {
+            close(fd);
+            return 0;
         }
     }
-    pclose(fp);
-    return found;
+    close(fd);
+    return 1;
 }
 
 static int ensure_adb_device(const char *target_device) {
-    if (is_any_device_connected()) return 1;
+    char ip[64] = "192.168.0.123";
+    int port = 5555;
     if (target_device && *target_device) {
-        char cmd[256];
-        snprintf(cmd, sizeof(cmd), "adb connect %s >/dev/null 2>&1", target_device);
-        system(cmd);
-        if (is_any_device_connected()) return 1;
-    }
-    FILE *fp = popen("nmap -T4 -p 30000-65535 192.168.0.123 2>/dev/null | awk -F'/' '/open/ {print $1; exit}'", "r");
-    if (fp) {
-        char port[32];
-        if (fgets(port, sizeof(port), fp)) {
-            int p = atoi(port);
-            if (p > 0) {
-                char cmd[256];
-                snprintf(cmd, sizeof(cmd), "adb connect 192.168.0.123:%d >/dev/null 2>&1", p);
-                system(cmd);
-            }
+        char buf[64];
+        strncpy(buf, target_device, sizeof(buf) - 1);
+        buf[sizeof(buf) - 1] = '\0';
+        char *colon = strchr(buf, ':');
+        if (colon) {
+            *colon = '\0';
+            int p = atoi(colon + 1);
+            if (p > 0 && p <= 65535) port = p;
         }
-        pclose(fp);
+        strncpy(ip, buf, sizeof(ip) - 1);
+        ip[sizeof(ip) - 1] = '\0';
     }
-    return is_any_device_connected();
+    if (!probe_device(ip, port)) return 0;
+    char target[128];
+    snprintf(target, sizeof(target), "%s:%d", ip, port);
+    char *args[] = {"adb", "connect", target, NULL};
+    return (run_cmd("adb", args) == 0);
+}
+
+static void spawn_scrcpy_server(void) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        sigset_t unblock;
+        sigemptyset(&unblock);
+        sigprocmask(SIG_SETMASK, &unblock, NULL);
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull >= 0) {
+            dup2(devnull, STDIN_FILENO);
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+            close(devnull);
+        }
+        execlp("adb", "adb", "shell",
+               "CLASSPATH=/data/local/tmp/scrcpy-server.jar app_process / "
+               "com.genymobile.scrcpy.Server 5.0.1 scid=00000001 video=false audio=false "
+               "control=true tunnel_forward=true send_device_meta=false send_dummy_byte=false cleanup=false",
+               (char *)NULL);
+        _exit(127);
+    }
 }
 
 static int start_android_connection(const char *target_device, int port) {
     if (!ensure_adb_device(target_device)) return -1;
-    system("adb push /usr/share/scrcpy/scrcpy-server /data/local/tmp/scrcpy-server.jar >/dev/null 2>&1");
-    char fwd[256];
-    snprintf(fwd, sizeof(fwd), "adb forward tcp:%d localabstract:scrcpy_00000001 >/dev/null 2>&1", port);
-    system(fwd);
-    system("adb shell \"CLASSPATH=/data/local/tmp/scrcpy-server.jar app_process / com.genymobile.scrcpy.Server 5.0.1 scid=00000001 video=false audio=false control=true tunnel_forward=true send_device_meta=false send_dummy_byte=false cleanup=false\" >/dev/null 2>&1 </dev/null &");
 
-    int s = socket(AF_INET, SOCK_STREAM, 0);
-    if (s < 0) return -1;
+    char *push_args[] = {"adb", "push", "/usr/share/scrcpy/scrcpy-server", "/data/local/tmp/scrcpy-server.jar", NULL};
+    run_cmd("adb", push_args);
+
+    char fwd_spec[32];
+    snprintf(fwd_spec, sizeof(fwd_spec), "tcp:%d", port);
+    char *fwd_args[] = {"adb", "forward", fwd_spec, "localabstract:scrcpy_00000001", NULL};
+    run_cmd("adb", fwd_args);
+
+    spawn_scrcpy_server();
+
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
@@ -194,11 +285,16 @@ static int start_android_connection(const char *target_device, int port) {
 
     for (int i = 0; i < 30; i++) {
         usleep(100000);
+        int s = socket(AF_INET, SOCK_STREAM, 0);
+        if (s < 0) continue;
         if (connect(s, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
             return s;
         }
+        close(s);
     }
-    close(s);
+
+    char *rm_args[] = {"adb", "forward", "--remove", fwd_spec, NULL};
+    run_cmd("adb", rm_args);
     return -1;
 }
 
@@ -257,9 +353,34 @@ int main(int argc, char **argv) {
 
     int android_port = 28888;
     int android_fd = start_android_connection(target, android_port);
+    int android_backoff_ms = 1000;
+    uint64_t android_retry_at_ms = 0;
+    if (android_fd < 0) {
+        android_retry_at_ms = get_monotonic_ms() + android_backoff_ms;
+        android_backoff_ms = (android_backoff_ms * 2 > 10000) ? 10000 : android_backoff_ms * 2;
+    }
 
     int running = 1;
     while (running) {
+        uint64_t now = get_monotonic_ms();
+
+        if (wl_paste_pid < 0 && now >= wl_paste_retry_at_ms) {
+            start_wl_paste(self_path);
+            now = get_monotonic_ms();
+        }
+
+        if (android_fd < 0 && now >= android_retry_at_ms) {
+            android_fd = start_android_connection(target, android_port);
+            now = get_monotonic_ms();
+            if (android_fd >= 0) {
+                android_backoff_ms = 1000;
+                android_retry_at_ms = 0;
+            } else {
+                android_retry_at_ms = now + android_backoff_ms;
+                android_backoff_ms = (android_backoff_ms * 2 > 10000) ? 10000 : android_backoff_ms * 2;
+            }
+        }
+
         struct pollfd fds[3];
         int nfds = 0;
 
@@ -278,16 +399,22 @@ int main(int argc, char **argv) {
             idx_android = nfds++;
         }
 
-        int timeout_ms = (android_fd < 0) ? 3000 : -1;
+        int timeout_ms = -1;
+        if (android_fd < 0) {
+            int t_android = (now >= android_retry_at_ms) ? 0 : (int)(android_retry_at_ms - now);
+            timeout_ms = t_android;
+        }
+        if (wl_paste_pid < 0) {
+            int t_wl = (now >= wl_paste_retry_at_ms) ? 0 : (int)(wl_paste_retry_at_ms - now);
+            if (timeout_ms < 0 || t_wl < timeout_ms) {
+                timeout_ms = t_wl;
+            }
+        }
+
         int pr = poll(fds, nfds, timeout_ms);
         if (pr < 0) {
             if (errno == EINTR) continue;
             break;
-        }
-
-        if (pr == 0 && android_fd < 0) {
-            android_fd = start_android_connection(target, android_port);
-            continue;
         }
 
         if (fds[idx_sig].revents & POLLIN) {
@@ -295,10 +422,20 @@ int main(int argc, char **argv) {
             while (read(sig_fd, &sinfo, sizeof(sinfo)) > 0) {
                 if (sinfo.ssi_signo == SIGCHLD) {
                     int st;
-                    pid_t ch = waitpid(-1, &st, WNOHANG);
-                    if (ch == wl_paste_pid) {
-                        wl_paste_pid = -1;
-                        start_wl_paste(self_path);
+                    pid_t ch;
+                    while ((ch = waitpid(-1, &st, WNOHANG)) > 0) {
+                        if (ch == wl_paste_pid) {
+                            wl_paste_pid = -1;
+                            uint64_t cur = get_monotonic_ms();
+                            if (cur - wl_paste_start_time < 2000) {
+                                wl_paste_retry_at_ms = cur + wl_paste_backoff_ms;
+                                wl_paste_backoff_ms = (wl_paste_backoff_ms * 2 > 10000) ? 10000 : wl_paste_backoff_ms * 2;
+                            } else {
+                                wl_paste_backoff_ms = 1000;
+                                wl_paste_retry_at_ms = 0;
+                                start_wl_paste(self_path);
+                            }
+                        }
                     }
                 } else if (sinfo.ssi_signo == SIGTERM || sinfo.ssi_signo == SIGINT || sinfo.ssi_signo == SIGHUP) {
                     running = 0;
@@ -332,6 +469,8 @@ int main(int argc, char **argv) {
                             if (send_to_android(android_fd, buf, len) < 0) {
                                 close(android_fd);
                                 android_fd = -1;
+                                android_backoff_ms = 1000;
+                                android_retry_at_ms = get_monotonic_ms() + android_backoff_ms;
                             }
                         }
                     }
@@ -346,6 +485,8 @@ int main(int argc, char **argv) {
             if (read_exact(android_fd, &type, 1) < 0) {
                 close(android_fd);
                 android_fd = -1;
+                android_backoff_ms = 1000;
+                android_retry_at_ms = get_monotonic_ms() + android_backoff_ms;
                 continue;
             }
             if (type == 0) {
@@ -353,12 +494,16 @@ int main(int argc, char **argv) {
                 if (read_exact(android_fd, &netlen, 4) < 0) {
                     close(android_fd);
                     android_fd = -1;
+                    android_backoff_ms = 1000;
+                    android_retry_at_ms = get_monotonic_ms() + android_backoff_ms;
                     continue;
                 }
                 uint32_t len = ntohl(netlen);
                 if (len > 1048576) {
                     close(android_fd);
                     android_fd = -1;
+                    android_backoff_ms = 1000;
+                    android_retry_at_ms = get_monotonic_ms() + android_backoff_ms;
                     continue;
                 }
                 char *text = malloc(len + 1);
@@ -367,6 +512,8 @@ int main(int argc, char **argv) {
                         free(text);
                         close(android_fd);
                         android_fd = -1;
+                        android_backoff_ms = 1000;
+                        android_retry_at_ms = get_monotonic_ms() + android_backoff_ms;
                         continue;
                     }
                     text[len] = '\0';
@@ -400,6 +547,9 @@ int main(int argc, char **argv) {
     unlink(sock_path);
     close(sig_fd);
     free(last_clip);
-    system("adb forward --remove tcp:28888 >/dev/null 2>&1");
+    char fwd_spec[32];
+    snprintf(fwd_spec, sizeof(fwd_spec), "tcp:%d", android_port);
+    char *rm_args[] = {"adb", "forward", "--remove", fwd_spec, NULL};
+    run_cmd("adb", rm_args);
     return 0;
 }
