@@ -9,6 +9,8 @@ Environment=WAYLAND_DISPLAY=wayland-0
 ExecStart=/usr/local/bin/clip-sync
 Restart=always
 RestartSec=3
+TimeoutStopSec=500ms
+ExecStopPost=/usr/bin/adb kill-server
 
 [Install]
 WantedBy=default.target
