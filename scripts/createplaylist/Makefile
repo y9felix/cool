@@ -1,7 +1,7 @@
 .POSIX:
 
-CC = ccache gcc
-CFLAGS = -std=c99 -pedantic -Wall -Wextra -Werror -O2 -march=skylake -fuse-ld=mold
+CC = cc
+CFLAGS = -std=c99 -pedantic -Wall -Wextra -Werror -O2
 LDFLAGS = -s
 
 all: m3u8gen
