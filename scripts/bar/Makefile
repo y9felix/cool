@@ -11,7 +11,7 @@ OBJ = $(SRC:.c=.o)
 
 all: bar
 
-$(OBJ): config.h config.mk $(PROTO_H)
+$(OBJ): config.h config.mk font.h $(PROTO_H)
 
 config.h:
 	cp config.def.h $@
