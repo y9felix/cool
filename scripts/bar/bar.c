@@ -62,7 +62,7 @@ die(const char *msg)
 }
 
 static int
-read_sysfs(const char *base, const char *entry, char *out, size_t sz)
+read_sysfs(const char *base, const char *entry)
 {
 	char b[32], p[128];
 	int fd, n;
@@ -70,16 +70,12 @@ read_sysfs(const char *base, const char *entry, char *out, size_t sz)
 	snprintf(p, sizeof(p), "%s/%s", base, entry);
 	if ((fd = open(p, O_RDONLY)) < 0)
 		return -1;
-	n = read(fd, out ? out : b, (out ? sz : sizeof(b)) - 1);
+	n = read(fd, b, sizeof(b) - 1);
 	close(fd);
 	if (n <= 0)
 		return -1;
-	if (out) {
-		out[n] = '\0';
-		return 0;
-	}
 	b[n] = '\0';
-	return atoi(b);
+	return b[0] == 'C' ? 'C' : atoi(b);
 }
 
 static int
@@ -87,9 +83,9 @@ update_brightness(void)
 {
 	int cur, max, val;
 
-	cur = read_sysfs(backlight_path, "brightness", NULL, 0);
-	max = read_sysfs(backlight_path, "max_brightness", NULL, 0);
-	val = (cur < 0 || max <= 0) ? -1 : (cur * 100 + max / 2) / max;
+	cur = read_sysfs(backlight_path, "brightness");
+	max = read_sysfs(backlight_path, "max_brightness");
+	val = (cur < 0 || max <= 0) ? 0 : (cur * 100 + max / 2) / max;
 	if (val == cur_bri)
 		return 0;
 	cur_bri = val;
@@ -114,25 +110,15 @@ setup_mixer(void)
 	snd_mixer_selem_id_free(sid);
 }
 
-static void
-toggle_mute(void)
-{
-	int sw;
-
-	if (mixer_elem) {
-		snd_mixer_selem_get_playback_switch(mixer_elem, SND_MIXER_SCHN_MONO, &sw);
-		snd_mixer_selem_set_playback_switch_all(mixer_elem, !sw);
-	}
-}
-
 static int
 update_volume(void)
 {
-	long min, max, vol;
-	int muted, sw = 1, v;
+	long max, min, vol;
+	int muted, sw, v;
 
 	if (!mixer_elem)
 		return 0;
+	sw = 1;
 	snd_mixer_selem_get_playback_volume_range(mixer_elem, &min, &max);
 	snd_mixer_selem_get_playback_volume(mixer_elem, SND_MIXER_SCHN_MONO, &vol);
 	snd_mixer_selem_get_playback_switch(mixer_elem, SND_MIXER_SCHN_MONO, &sw);
@@ -148,11 +134,11 @@ update_volume(void)
 static int
 update_battery(void)
 {
-	char b[16];
 	int bat, chg;
 
-	bat = read_sysfs(battery_path, "capacity", NULL, 0);
-	chg = (read_sysfs(battery_path, "status", b, sizeof(b)) == 0 && b[0] == 'C');
+	bat = read_sysfs(battery_path, "capacity");
+	bat = bat < 0 ? 0 : bat;
+	chg = (read_sysfs(battery_path, "status") == 'C');
 	if (bat == cur_bat && chg == cur_chg)
 		return 0;
 	cur_bat = bat;
@@ -163,9 +149,10 @@ update_battery(void)
 static int
 update_clock(void)
 {
-	time_t now = time(NULL);
 	char b[32];
+	time_t now;
 
+	now = time(NULL);
 	strftime(b, sizeof(b), time_format, localtime(&now));
 	if (!strcmp(b, cur_time))
 		return 0;
@@ -209,21 +196,18 @@ blend_pixel(int x, int y, uint32_t c, uint8_t a)
 static int
 draw_string(int x, int y, const char *str, uint32_t color)
 {
-	int orig_x = x;
+	int c, col, idx, orig_x, row;
+	uint8_t a;
 
-	while (*str) {
-		int idx = ((unsigned char)*str >= 32 && (unsigned char)*str <= 126) ? ((unsigned char)*str - 32) : 0;
-		int row, col;
-
+	orig_x = x;
+	for (; (c = (unsigned char)*str); str++, x += FONT_WIDTH) {
+		idx = (c >= 32 && c <= 126) ? c - 32 : 0;
 		for (row = 0; row < FONT_HEIGHT; row++) {
 			for (col = 0; col < FONT_WIDTH; col++) {
-				uint8_t a = font_data[idx][row * FONT_WIDTH + col];
-				if (a)
+				if ((a = font_data[idx][row * FONT_WIDTH + col]))
 					blend_pixel(x + col, y + row, color, a);
 			}
 		}
-		x += FONT_WIDTH;
-		str++;
 	}
 	return x - orig_x;
 }
@@ -231,23 +215,20 @@ draw_string(int x, int y, const char *str, uint32_t color)
 static void
 draw_line(double x0, double y0, double x1, double y1, uint32_t color, double th)
 {
-	int min_x = (int)(floor(fmin(x0, x1) - th - 1.0));
-	int max_x = (int)(ceil(fmax(x0, x1) + th + 1.0));
-	int min_y = (int)(floor(fmin(y0, y1) - th - 1.0));
-	int max_y = (int)(ceil(fmax(y0, y1) + th + 1.0));
-	double dx = x1 - x0, dy = y1 - y0;
-	double len_sq = dx * dx + dy * dy;
-	int x, y;
+	double a, d, dx, dy, len_sq, px, py, t;
+	int max_x, max_y, min_x, min_y, x, y;
 
+	dx = x1 - x0;
+	dy = y1 - y0;
+	len_sq = dx * dx + dy * dy;
+	min_x = (int)floor(fmin(x0, x1) - th - 1.0);
+	max_x = (int)ceil(fmax(x0, x1) + th + 1.0);
+	min_y = (int)floor(fmin(y0, y1) - th - 1.0);
+	max_y = (int)ceil(fmax(y0, y1) + th + 1.0);
 	for (y = min_y; y <= max_y; y++) {
 		for (x = min_x; x <= max_x; x++) {
-			double t, px, py, d, a;
-
 			t = len_sq <= 0.0001 ? 0.0 : ((x + 0.5 - x0) * dx + (y + 0.5 - y0) * dy) / len_sq;
-			if (t < 0.0)
-				t = 0.0;
-			else if (t > 1.0)
-				t = 1.0;
+			t = t < 0.0 ? 0.0 : (t > 1.0 ? 1.0 : t);
 			px = x0 + t * dx;
 			py = y0 + t * dy;
 			d = hypot(x + 0.5 - px, y + 0.5 - py);
@@ -263,25 +244,23 @@ draw_line(double x0, double y0, double x1, double y1, uint32_t color, double th)
 static void
 draw_arc(double cx, double cy, double r, double a0, double a1, uint32_t color, double th)
 {
-	int min_x = (int)(floor(cx - r - th - 1.0));
-	int max_x = (int)(ceil(cx + r + th + 1.0));
-	int min_y = (int)(floor(cy - r - th - 1.0));
-	int max_y = (int)(ceil(cy + r + th + 1.0));
-	int x, y;
+	double a, cov, d, dist, dx, dy;
+	int max_x, max_y, min_x, min_y, x, y;
 
+	min_x = (int)floor(cx - r - th - 1.0);
+	max_x = (int)ceil(cx + r + th + 1.0);
+	min_y = (int)floor(cy - r - th - 1.0);
+	max_y = (int)ceil(cy + r + th + 1.0);
 	for (y = min_y; y <= max_y; y++) {
 		for (x = min_x; x <= max_x; x++) {
-			double dx = x + 0.5 - cx;
-			double dy = y + 0.5 - cy;
-			double d = hypot(dx, dy);
-			double a = atan2(dy, dx);
-
+			dx = x + 0.5 - cx;
+			dy = y + 0.5 - cy;
+			d = hypot(dx, dy);
+			a = atan2(dy, dx);
 			if ((a0 <= -PI && a1 >= PI) || (a >= a0 && a <= a1)) {
-				double dist = fabs(d - r);
-
+				dist = fabs(d - r);
 				if (dist < th / 2.0 + 0.5) {
-					double cov = 1.0 - (dist - (th / 2.0 - 0.5));
-
+					cov = 1.0 - (dist - (th / 2.0 - 0.5));
 					if (cov > 0.0)
 						blend_pixel(x, y, color, (uint8_t)((cov > 1.0 ? 1.0 : cov) * 255.0 + 0.5));
 				}
@@ -293,25 +272,25 @@ draw_arc(double cx, double cy, double r, double a0, double a1, uint32_t color, d
 static void
 draw_rounded_rect(double x0, double y0, double w, double h, double r, uint32_t color, double th, int fill)
 {
-	int min_x = (int)(floor(x0 - th - 1.0));
-	int max_x = (int)(ceil(x0 + w + th + 1.0));
-	int min_y = (int)(floor(y0 - th - 1.0));
-	int max_y = (int)(ceil(y0 + h + th + 1.0));
-	int x, y;
+	double cov, d, inner, mx, my, px, py, qx, qy;
+	int max_x, max_y, min_x, min_y, x, y;
 
+	min_x = (int)floor(x0 - th - 1.0);
+	max_x = (int)ceil(x0 + w + th + 1.0);
+	min_y = (int)floor(y0 - th - 1.0);
+	max_y = (int)ceil(y0 + h + th + 1.0);
 	for (y = min_y; y <= max_y; y++) {
 		for (x = min_x; x <= max_x; x++) {
-			double px = (x + 0.5) - (x0 + w / 2.0);
-			double py = (y + 0.5) - (y0 + h / 2.0);
-			double qx = fabs(px) - (w / 2.0 - r);
-			double qy = fabs(py) - (h / 2.0 - r);
-			double mx = qx > 0.0 ? qx : 0.0;
-			double my = qy > 0.0 ? qy : 0.0;
-			double inner = (qx > qy ? qx : qy);
-			double d = sqrt(mx * mx + my * my) + (inner > 0.0 ? 0.0 : inner) - r;
-			double cov = fill ? (d < 0.5 ? 0.5 - d : 0.0)
-			                  : (fabs(d) < th / 2.0 + 0.5 ? 1.0 - (fabs(d) - (th / 2.0 - 0.5)) : 0.0);
-
+			px = (x + 0.5) - (x0 + w / 2.0);
+			py = (y + 0.5) - (y0 + h / 2.0);
+			qx = fabs(px) - (w / 2.0 - r);
+			qy = fabs(py) - (h / 2.0 - r);
+			mx = qx > 0.0 ? qx : 0.0;
+			my = qy > 0.0 ? qy : 0.0;
+			inner = (qx > qy ? qx : qy);
+			d = sqrt(mx * mx + my * my) + (inner > 0.0 ? 0.0 : inner) - r;
+			cov = fill ? (d < 0.5 ? 0.5 - d : 0.0)
+			           : (fabs(d) < th / 2.0 + 0.5 ? 1.0 - (fabs(d) - (th / 2.0 - 0.5)) : 0.0);
 			if (cov > 0.0)
 				blend_pixel(x, y, color, (uint8_t)((cov > 1.0 ? 1.0 : cov) * 255.0 + 0.5));
 		}
@@ -321,8 +300,9 @@ draw_rounded_rect(double x0, double y0, double w, double h, double r, uint32_t c
 static int
 point_in_poly(double px, double py, double pts[][2], int n)
 {
-	int i, j, c = 0;
+	int c, i, j;
 
+	c = 0;
 	for (i = 0, j = n - 1; i < n; j = i++) {
 		if (((pts[i][1] > py) != (pts[j][1] > py)) &&
 		    (px < (pts[j][0] - pts[i][0]) * (py - pts[i][1]) / (pts[j][1] - pts[i][1]) + pts[i][0]))
@@ -334,9 +314,11 @@ point_in_poly(double px, double py, double pts[][2], int n)
 static void
 draw_poly(double pts[][2], int n, uint32_t color)
 {
-	double min_x = pts[0][0], max_x = pts[0][0], min_y = pts[0][1], max_y = pts[0][1];
-	int i, x, y;
+	double max_x, max_y, min_x, min_y;
+	int hits, i, x, y;
 
+	min_x = max_x = pts[0][0];
+	min_y = max_y = pts[0][1];
 	for (i = 1; i < n; i++) {
 		if (pts[i][0] < min_x)
 			min_x = pts[i][0];
@@ -349,11 +331,10 @@ draw_poly(double pts[][2], int n, uint32_t color)
 	}
 	for (y = (int)floor(min_y); y <= (int)ceil(max_y); y++) {
 		for (x = (int)floor(min_x); x <= (int)ceil(max_x); x++) {
-			int hits = point_in_poly(x + 0.25, y + 0.25, pts, n)
-			         + point_in_poly(x + 0.75, y + 0.25, pts, n)
-			         + point_in_poly(x + 0.25, y + 0.75, pts, n)
-			         + point_in_poly(x + 0.75, y + 0.75, pts, n);
-
+			hits = point_in_poly(x + 0.25, y + 0.25, pts, n)
+			     + point_in_poly(x + 0.75, y + 0.25, pts, n)
+			     + point_in_poly(x + 0.25, y + 0.75, pts, n)
+			     + point_in_poly(x + 0.75, y + 0.75, pts, n);
 			if (hits > 0)
 				blend_pixel(x, y, color, (uint8_t)(hits * 63.75 + 0.5));
 		}
@@ -363,31 +344,27 @@ draw_poly(double pts[][2], int n, uint32_t color)
 static void
 draw_icon_brightness(int x, int y, int lvl, uint32_t color)
 {
-	double cx = x + 10.0, cy = y + 10.0, r = 5.95;
-	double ax = r * ((double)lvl / 3.0 - 1.0);
+	double ax, cov, cx, cy, d, dx, dy, r, w;
 	int px, py;
 
+	cx = x + 10.0;
+	cy = y + 10.0;
+	r = 5.95;
+	ax = r * ((double)lvl / 3.0 - 1.0);
 	draw_arc(cx, cy, 6.8, -PI, PI, color, 1.7);
 	if (lvl <= 0)
 		return;
 	for (py = (int)floor(cy - r - 1.0); py <= (int)ceil(cy + r + 1.0); py++) {
 		for (px = (int)floor(cx - r - 1.0); px <= (int)ceil(cx + r + 1.0); px++) {
-			double dx = px + 0.5 - cx;
-			double dy = py + 0.5 - cy;
-
+			dx = px + 0.5 - cx;
+			dy = py + 0.5 - cy;
 			if (fabs(dy) < r) {
-				double w = sqrt(1.0 - (dy / r) * (dy / r));
-
+				w = sqrt(1.0 - (dy / r) * (dy / r));
 				if (dx >= -r * w && dx <= ax * w) {
-					double d = hypot(dx, dy);
-					double cov = 1.0;
-
-					if (d > r - 0.5)
-						cov = 1.0 - (d - (r - 0.5));
-					if (cov > 1.0)
-						cov = 1.0;
+					d = hypot(dx, dy);
+					cov = d > r - 0.5 ? 1.0 - (d - (r - 0.5)) : 1.0;
 					if (cov > 0.0)
-						blend_pixel(px, py, color, (uint8_t)(cov * 255.0 + 0.5));
+						blend_pixel(px, py, color, (uint8_t)((cov > 1.0 ? 1.0 : cov) * 255.0 + 0.5));
 				}
 			}
 		}
@@ -397,30 +374,25 @@ draw_icon_brightness(int x, int y, int lvl, uint32_t color)
 static void
 draw_icon_volume(int x, int y, int lvl, int muted, uint32_t color)
 {
+	int i;
 	double pts[6][2] = {
 		{ x + 1.2, y + 7.6 }, { x + 4.2, y + 7.6 }, { x + 7.2, y + 3.6 },
 		{ x + 7.2, y + 16.4 }, { x + 4.2, y + 12.4 }, { x + 1.2, y + 12.4 }
 	};
-	int i;
 
 	draw_poly(pts, 6, color);
 	if (muted) {
 		draw_line(x + 10.4, y + 7.2, x + 15.6, y + 12.8, color, 1.6);
 		draw_line(x + 15.6, y + 7.2, x + 10.4, y + 12.8, color, 1.6);
 	} else {
-		for (i = 0; i < 4; i++) {
-			double r = (0.14 + i * 0.14) * 20.0;
-			double th = (i < lvl ? 1.7 : 0.6);
-
-			draw_arc(x + 6.8, y + 10.0, r, -0.84, 0.84, color, th);
-		}
+		for (i = 0; i < 4; i++)
+			draw_arc(x + 6.8, y + 10.0, (0.14 + i * 0.14) * 20.0, -0.84, 0.84, color, i < lvl ? 1.7 : 0.6);
 	}
 }
 
 static void
 draw_icon_battery(int x, int y, int lvl, int chg, uint32_t color)
 {
-	double filled_w = 2.0 + (18.2 * (lvl + 1)) / 6.0;
 	double bolt[6][2] = {
 		{ x + 13.41, y + 5.56 }, { x + 6.90, y + 10.44 }, { x + 10.26, y + 10.44 },
 		{ x + 9.21, y + 14.44 }, { x + 15.30, y + 9.33 }, { x + 11.94, y + 9.33 }
@@ -428,27 +400,22 @@ draw_icon_battery(int x, int y, int lvl, int chg, uint32_t color)
 
 	draw_rounded_rect(x + 0.8, y + 3.8, 20.6, 12.4, 1.6, color, 1.6, 0);
 	draw_rounded_rect(x + 22.4, y + 8.0, 2.2, 4.0, 0.6, color, 0, 1);
-	draw_rounded_rect(x + 2.0, y + 5.0, filled_w, 10.0, 0.6, color, 0, 1);
+	draw_rounded_rect(x + 2.0, y + 5.0, 2.0 + (18.2 * (lvl + 1)) / 6.0, 10.0, 0.6, color, 0, 1);
 	if (chg)
 		draw_poly(bolt, 6, color_bg);
-}
-
-static void
-draw_icon_clock(int x, int y, uint32_t color)
-{
-	draw_arc(x + 10.0, y + 10.0, 6.8, -PI, PI, color, 1.6);
-	draw_line(x + 10.0, y + 10.0, x + 10.0, y + 5.6, color, 1.6);
-	draw_line(x + 10.0, y + 10.0, x + 13.2, y + 11.6, color, 1.6);
 }
 
 static void
 update_input_region(void)
 {
 	struct wl_region *r;
-	int x = 0, y = 0, w = bar_width, h = bar_height;
+	int h, w, x, y;
 
 	if (!(r = wl_compositor_create_region(comp)))
 		return;
+	x = y = 0;
+	w = bar_width;
+	h = bar_height;
 	if (!visible && opt_autohide) {
 		w = h = hotspot_size;
 		x = (selected_corner & 1) ? bar_width - hotspot_size : 0;
@@ -475,34 +442,33 @@ draw(void)
 		p = (uint32_t *)pixel_data;
 		for (i = 0; i < (size_t)bar_width * bar_height; i++)
 			p[i] = color_bg;
-
 		x = padding_x;
 		icon_y = (bar_height - icon_size) / 2;
-		if (icon_y < 0)
-			icon_y = 0;
+		icon_y = icon_y < 0 ? 0 : icon_y;
 		text_y = (bar_height - FONT_HEIGHT) / 2;
-
 		for (i = 0; i < 4; i++) {
 			color = color_fg;
 			iw = icon_size;
 			switch (i) {
 			case 0:
 				draw_icon_brightness(x, icon_y, LEVEL(cur_bri, 6), color);
-				snprintf(mod_text, sizeof(mod_text), "%d%%", cur_bri < 0 ? 0 : cur_bri);
+				snprintf(mod_text, sizeof(mod_text), "%d%%", cur_bri);
 				break;
 			case 1:
 				if (cur_mute)
 					color = color_disabled;
 				draw_icon_volume(x, icon_y, LEVEL(cur_vol, 4), cur_mute, color);
-				snprintf(mod_text, sizeof(mod_text), "%d%%", cur_vol < 0 ? 0 : cur_vol);
+				snprintf(mod_text, sizeof(mod_text), "%d%%", cur_vol);
 				break;
 			case 2:
 				iw = (int)(1.25 * icon_size + 0.5);
 				draw_icon_battery(x, icon_y, LEVEL(cur_bat, 5), cur_chg, color);
-				snprintf(mod_text, sizeof(mod_text), "%d%%", cur_bat < 0 ? 0 : cur_bat);
+				snprintf(mod_text, sizeof(mod_text), "%d%%", cur_bat);
 				break;
 			case 3:
-				draw_icon_clock(x, icon_y, color);
+				draw_arc(x + 10.0, icon_y + 10.0, 6.8, -PI, PI, color, 1.6);
+				draw_line(x + 10.0, icon_y + 10.0, x + 10.0, icon_y + 5.6, color, 1.6);
+				draw_line(x + 10.0, icon_y + 10.0, x + 13.2, icon_y + 11.6, color, 1.6);
 				snprintf(mod_text, sizeof(mod_text), "%s", cur_time);
 				break;
 			}
@@ -532,27 +498,30 @@ arm_timer(int enable)
 }
 
 static void
-ptr_enter(void *d, struct wl_pointer *p, uint32_t s, struct wl_surface *sf, wl_fixed_t sx, wl_fixed_t sy)
+set_visibility(int v)
 {
-	pointer_x = wl_fixed_to_int(sx);
-	if (!visible) {
-		visible = 1;
-		arm_timer(1);
+	if (visible != v) {
+		visible = v;
+		arm_timer(v);
 		update_input_region();
-		update_all();
+		if (v)
+			update_all();
 		draw();
 	}
 }
 
 static void
+ptr_enter(void *d, struct wl_pointer *p, uint32_t s, struct wl_surface *sf, wl_fixed_t sx, wl_fixed_t sy)
+{
+	pointer_x = wl_fixed_to_int(sx);
+	set_visibility(1);
+}
+
+static void
 ptr_leave(void *d, struct wl_pointer *p, uint32_t s, struct wl_surface *sf)
 {
-	if (opt_autohide && visible) {
-		visible = 0;
-		arm_timer(0);
-		update_input_region();
-		draw();
-	}
+	if (opt_autohide)
+		set_visibility(0);
 }
 
 static void
@@ -564,8 +533,11 @@ ptr_motion(void *d, struct wl_pointer *p, uint32_t t, wl_fixed_t sx, wl_fixed_t 
 static void
 ptr_btn(void *d, struct wl_pointer *p, uint32_t s, uint32_t t, uint32_t b, uint32_t st)
 {
-	if (st && b == 0x110 && pointer_x >= bounds[0] && pointer_x < bounds[1]) {
-		toggle_mute();
+	int sw;
+
+	if (st && b == 0x110 && pointer_x >= bounds[0] && pointer_x < bounds[1] && mixer_elem) {
+		snd_mixer_selem_get_playback_switch(mixer_elem, SND_MIXER_SCHN_MONO, &sw);
+		snd_mixer_selem_set_playback_switch_all(mixer_elem, !sw);
 		if (update_volume() && visible)
 			draw();
 	}
@@ -660,10 +632,9 @@ setup_wayland(void)
 {
 	static const uint32_t anchors[] = { 5, 9, 6, 10 };
 	struct sockaddr_nl sa = { .nl_family = AF_NETLINK, .nl_groups = 1 };
-	struct sigaction act = { .sa_handler = sig_handler };
 
-	sigaction(SIGINT, &act, NULL);
-	sigaction(SIGTERM, &act, NULL);
+	signal(SIGINT, sig_handler);
+	signal(SIGTERM, sig_handler);
 	setup_mixer();
 	timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
 	if ((netlink_fd = socket(AF_NETLINK, SOCK_RAW | SOCK_NONBLOCK | SOCK_CLOEXEC, NETLINK_KOBJECT_UEVENT)) >= 0) {
@@ -709,8 +680,12 @@ int
 main(int argc, char **argv)
 {
 	struct pollfd pfds[8];
-	int alsa_count = 0, i, nfds, opt;
+	uint64_t exp;
+	ssize_t j, len;
+	char nlk[1024];
+	int alsa_count, dirty, i, nfds, opt;
 
+	alsa_count = 0;
 	while ((opt = getopt(argc, argv, "c:nhv")) >= 0) {
 		switch (opt) {
 		case 'c':
@@ -753,10 +728,7 @@ main(int argc, char **argv)
 	}
 
 	while (running) {
-		uint64_t exp;
-		char nlk[1024];
-		int dirty = 0;
-
+		dirty = 0;
 		while (wl_display_prepare_read(dpy) < 0)
 			wl_display_dispatch_pending(dpy);
 		wl_display_flush(dpy);
@@ -779,8 +751,6 @@ main(int argc, char **argv)
 				dirty |= update_clock();
 		}
 		if (netlink_fd >= 0 && (pfds[2].revents & POLLIN)) {
-			ssize_t j, len;
-
 			while ((len = recv(netlink_fd, nlk, sizeof(nlk) - 1, 0)) > 0) {
 				for (j = 0; j < len; j++) {
 					if (nlk[j] == '\0')
