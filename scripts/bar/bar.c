@@ -51,11 +51,10 @@ static snd_mixer_t *mixer;
 static snd_mixer_elem_t *mixer_elem;
 static void *pixel_data;
 static size_t buffer_size;
-static int timer_fd = -1, netlink_fd = -1;
-static int cur_bri = -1, cur_vol = -1, cur_mute = -1, cur_bat = -1, cur_chg = -1;
-static char cur_time[32];
-static int selected_corner = corner;
+static int timer_fd = -1, netlink_fd = -1, cur_bri = -1, cur_vol = -1;
+static int cur_mute = -1, cur_bat = -1, cur_chg = -1, selected_corner = corner;
 static int opt_autohide = autohide, visible, configured, pointer_x, bounds[2];
+static char cur_time[32];
 static volatile sig_atomic_t running = 1;
 
 static void
@@ -66,32 +65,24 @@ die(const char *msg)
 }
 
 static int
-read_int(const char *path)
+read_sysfs(const char *base, const char *entry, char *out, size_t sz)
 {
-	char b[32];
+	char b[32], p[128];
 	int fd, n;
 
-	if ((fd = open(path, O_RDONLY)) < 0)
+	snprintf(p, sizeof(p), "%s/%s", base, entry);
+	if ((fd = open(p, O_RDONLY)) < 0)
 		return -1;
-	n = read(fd, b, sizeof(b) - 1);
+	n = read(fd, out ? out : b, (out ? sz : sizeof(b)) - 1);
 	close(fd);
 	if (n <= 0)
 		return -1;
+	if (out) {
+		out[n] = '\0';
+		return 0;
+	}
 	b[n] = '\0';
 	return atoi(b);
-}
-
-static int
-get_brightness(void)
-{
-	char p[128];
-	int cur, max;
-
-	snprintf(p, sizeof(p), "%s/brightness", backlight_path);
-	cur = read_int(p);
-	snprintf(p, sizeof(p), "%s/max_brightness", backlight_path);
-	max = read_int(p);
-	return (cur < 0 || max <= 0) ? -1 : (cur * 100 + max / 2) / max;
 }
 
 static void
@@ -103,8 +94,11 @@ set_brightness_delta(int delta)
 static int
 update_brightness(void)
 {
-	int val = get_brightness();
+	int cur, max, val;
 
+	cur = read_sysfs(backlight_path, "brightness", NULL, 0);
+	max = read_sysfs(backlight_path, "max_brightness", NULL, 0);
+	val = (cur < 0 || max <= 0) ? -1 : (cur * 100 + max / 2) / max;
 	if (val == cur_bri)
 		return 0;
 	cur_bri = val;
@@ -127,21 +121,6 @@ setup_mixer(void)
 	snd_mixer_selem_id_set_name(sid, alsa_mixer);
 	mixer_elem = snd_mixer_find_selem(mixer, sid);
 	snd_mixer_selem_id_free(sid);
-}
-
-static int
-get_volume(int *muted)
-{
-	long min, max, vol;
-	int sw = 1;
-
-	if (!mixer_elem)
-		return -1;
-	snd_mixer_selem_get_playback_volume_range(mixer_elem, &min, &max);
-	snd_mixer_selem_get_playback_volume(mixer_elem, SND_MIXER_SCHN_MONO, &vol);
-	snd_mixer_selem_get_playback_switch(mixer_elem, SND_MIXER_SCHN_MONO, &sw);
-	*muted = !sw;
-	return max > min ? (vol - min) * 100 / (max - min) : 0;
 }
 
 static void
@@ -172,40 +151,31 @@ toggle_mute(void)
 static int
 update_volume(void)
 {
-	int muted = 0, vol;
+	long min, max, vol;
+	int muted, sw = 1, v;
 
-	vol = get_volume(&muted);
-	if (vol == cur_vol && muted == cur_mute)
+	if (!mixer_elem)
 		return 0;
-	cur_vol = vol;
+	snd_mixer_selem_get_playback_volume_range(mixer_elem, &min, &max);
+	snd_mixer_selem_get_playback_volume(mixer_elem, SND_MIXER_SCHN_MONO, &vol);
+	snd_mixer_selem_get_playback_switch(mixer_elem, SND_MIXER_SCHN_MONO, &sw);
+	muted = !sw;
+	v = max > min ? (vol - min) * 100 / (max - min) : 0;
+	if (v == cur_vol && muted == cur_mute)
+		return 0;
+	cur_vol = v;
 	cur_mute = muted;
 	return 1;
 }
 
 static int
-get_battery(int *charging)
-{
-	char b[16], p[128];
-	int fd, cap;
-
-	snprintf(p, sizeof(p), "%s/capacity", battery_path);
-	cap = read_int(p);
-	snprintf(p, sizeof(p), "%s/status", battery_path);
-	*charging = 0;
-	if ((fd = open(p, O_RDONLY)) >= 0) {
-		if (read(fd, b, sizeof(b)) > 0)
-			*charging = (b[0] == 'C');
-		close(fd);
-	}
-	return cap;
-}
-
-static int
 update_battery(void)
 {
+	char b[16];
 	int bat, chg;
 
-	bat = get_battery(&chg);
+	bat = read_sysfs(battery_path, "capacity", NULL, 0);
+	chg = (read_sysfs(battery_path, "status", b, sizeof(b)) == 0 && b[0] == 'C');
 	if (bat == cur_bat && chg == cur_chg)
 		return 0;
 	cur_bat = bat;
@@ -238,17 +208,11 @@ update_all(void)
 static void
 rounded_rect(cairo_t *cr, double x0, double y0, double x1, double y1, double r)
 {
-	double c = r * KAPPA;
-
-	cairo_move_to(cr, x0 + r, y0);
-	cairo_line_to(cr, x1 - r, y0);
-	cairo_curve_to(cr, x1 - r + c, y0, x1, y0 + r - c, x1, y0 + r);
-	cairo_line_to(cr, x1, y1 - r);
-	cairo_curve_to(cr, x1, y1 - r + c, x1 - r + c, y1, x1 - r, y1);
-	cairo_line_to(cr, x0 + r, y1);
-	cairo_curve_to(cr, x0 + r - c, y1, x0, y1 - r + c, x0, y1 - r);
-	cairo_line_to(cr, x0, y0 + r);
-	cairo_curve_to(cr, x0, y0 + r - c, x0 + r - c, y0, x0 + r, y0);
+	cairo_new_sub_path(cr);
+	cairo_arc(cr, x1 - r, y0 + r, r, -PI / 2, 0);
+	cairo_arc(cr, x1 - r, y1 - r, r, 0, PI / 2);
+	cairo_arc(cr, x0 + r, y1 - r, r, PI / 2, PI);
+	cairo_arc(cr, x0 + r, y0 + r, r, PI, 3 * PI / 2);
 	cairo_close_path(cr);
 }
 
@@ -289,8 +253,10 @@ draw_icon_volume(cairo_t *cr, int lvl, int muted)
 	cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
 	if (muted) {
 		cairo_set_line_width(cr, 0.08);
-		cairo_move_to(cr, 0.52, 0.36); cairo_line_to(cr, 0.78, 0.64);
-		cairo_move_to(cr, 0.78, 0.36); cairo_line_to(cr, 0.52, 0.64);
+		cairo_move_to(cr, 0.52, 0.36);
+		cairo_line_to(cr, 0.78, 0.64);
+		cairo_move_to(cr, 0.78, 0.36);
+		cairo_line_to(cr, 0.52, 0.64);
 		cairo_stroke(cr);
 	} else {
 		for (i = 0; i < 4; i++) {
@@ -346,17 +312,16 @@ static void
 update_input_region(void)
 {
 	struct wl_region *r;
-	int hx, hy;
+	int x = 0, y = 0, w = bar_width, h = bar_height;
 
 	if (!(r = wl_compositor_create_region(comp)))
 		return;
-	if (visible || !opt_autohide) {
-		wl_region_add(r, 0, 0, bar_width, bar_height);
-	} else {
-		hx = (selected_corner & 1) ? bar_width - hotspot_size : 0;
-		hy = (selected_corner & 2) ? bar_height - hotspot_size : 0;
-		wl_region_add(r, hx, hy, hotspot_size, hotspot_size);
+	if (!visible && opt_autohide) {
+		w = h = hotspot_size;
+		x = (selected_corner & 1) ? bar_width - hotspot_size : 0;
+		y = (selected_corner & 2) ? bar_height - hotspot_size : 0;
 	}
+	wl_region_add(r, x, y, w, h);
 	wl_surface_set_input_region(surf, r);
 	wl_region_destroy(r);
 }
@@ -372,71 +337,64 @@ draw(void)
 
 	if (!back_cr || !configured)
 		return;
-	cairo_new_path(back_cr);
-	cairo_set_operator(back_cr, CAIRO_OPERATOR_SOURCE);
-	SET_RGBA(back_cr, color_bg);
-	cairo_paint(back_cr);
-	cairo_set_operator(back_cr, CAIRO_OPERATOR_OVER);
-
-	x = padding_x;
-	icon_y = (bar_height - icon_size) / 2;
-	if (icon_y < 0)
-		icon_y = 0;
-	cairo_font_extents(back_cr, &fext);
-	y = (bar_height - (int)(fext.height + 0.5)) / 2 + (int)(fext.ascent + 0.5);
-
-	for (i = 0; i < 4; i++) {
-		SET_RGBA(back_cr, color_fg);
-		iw = icon_size;
+	if (opt_autohide && !visible) {
+		memset(pixel_data, 0, buffer_size);
+	} else {
 		cairo_new_path(back_cr);
-		cairo_save(back_cr);
-		cairo_translate(back_cr, x, icon_y);
-		cairo_scale(back_cr, icon_size, icon_size);
-		switch (i) {
-		case 0:
-			draw_icon_brightness(back_cr, LEVEL(cur_bri, 6));
-			snprintf(mod_text, sizeof(mod_text), "%d%%", cur_bri < 0 ? 0 : cur_bri);
-			break;
-		case 1:
-			if (cur_mute)
-				SET_RGBA(back_cr, color_disabled);
-			draw_icon_volume(back_cr, LEVEL(cur_vol, 4), cur_mute);
-			snprintf(mod_text, sizeof(mod_text), "%d%%", cur_vol < 0 ? 0 : cur_vol);
-			break;
-		case 2:
-			iw = (int)(1.25 * icon_size + 0.5);
-			draw_icon_battery(back_cr, LEVEL(cur_bat, 5), cur_chg);
-			snprintf(mod_text, sizeof(mod_text), "%d%%", cur_bat < 0 ? 0 : cur_bat);
-			break;
-		case 3:
-			draw_icon_clock(back_cr);
-			snprintf(mod_text, sizeof(mod_text), "%s", cur_time);
-			break;
+		cairo_set_operator(back_cr, CAIRO_OPERATOR_SOURCE);
+		SET_RGBA(back_cr, color_bg);
+		cairo_paint(back_cr);
+		cairo_set_operator(back_cr, CAIRO_OPERATOR_OVER);
+
+		x = padding_x;
+		icon_y = (bar_height - icon_size) / 2;
+		if (icon_y < 0)
+			icon_y = 0;
+		cairo_font_extents(back_cr, &fext);
+		y = (bar_height - (int)(fext.height + 0.5)) / 2 + (int)(fext.ascent + 0.5);
+
+		for (i = 0; i < 4; i++) {
+			SET_RGBA(back_cr, color_fg);
+			iw = icon_size;
+			cairo_new_path(back_cr);
+			cairo_save(back_cr);
+			cairo_translate(back_cr, x, icon_y);
+			cairo_scale(back_cr, icon_size, icon_size);
+			switch (i) {
+			case 0:
+				draw_icon_brightness(back_cr, LEVEL(cur_bri, 6));
+				snprintf(mod_text, sizeof(mod_text), "%d%%", cur_bri < 0 ? 0 : cur_bri);
+				break;
+			case 1:
+				if (cur_mute)
+					SET_RGBA(back_cr, color_disabled);
+				draw_icon_volume(back_cr, LEVEL(cur_vol, 4), cur_mute);
+				snprintf(mod_text, sizeof(mod_text), "%d%%", cur_vol < 0 ? 0 : cur_vol);
+				break;
+			case 2:
+				iw = (int)(1.25 * icon_size + 0.5);
+				draw_icon_battery(back_cr, LEVEL(cur_bat, 5), cur_chg);
+				snprintf(mod_text, sizeof(mod_text), "%d%%", cur_bat < 0 ? 0 : cur_bat);
+				break;
+			case 3:
+				draw_icon_clock(back_cr);
+				snprintf(mod_text, sizeof(mod_text), "%s", cur_time);
+				break;
+			}
+			cairo_restore(back_cr);
+			cairo_new_path(back_cr);
+			x += iw + icon_spacing;
+			cairo_text_extents(back_cr, mod_text, &text);
+			cairo_move_to(back_cr, x, y);
+			cairo_show_text(back_cr, mod_text);
+			cairo_new_path(back_cr);
+			x += (int)(text.x_advance + 0.5) + spacing;
+			if (i < 2)
+				bounds[i] = x;
 		}
-		cairo_restore(back_cr);
-		cairo_new_path(back_cr);
-		x += iw + icon_spacing;
-		cairo_text_extents(back_cr, mod_text, &text);
-		cairo_move_to(back_cr, x, y);
-		cairo_show_text(back_cr, mod_text);
-		cairo_new_path(back_cr);
-		x += (int)(text.x_advance + 0.5) + spacing;
-		if (i < 2)
-			bounds[i] = x;
+		cairo_surface_flush(back_surf);
+		memcpy(pixel_data, cairo_image_surface_get_data(back_surf), buffer_size);
 	}
-	cairo_surface_flush(back_surf);
-	memcpy(pixel_data, cairo_image_surface_get_data(back_surf), buffer_size);
-	wl_surface_damage(surf, 0, 0, bar_width, bar_height);
-	wl_surface_attach(surf, buf, 0, 0);
-	wl_surface_commit(surf);
-}
-
-static void
-clear_surface(void)
-{
-	if (!pixel_data || !surf || !buf || !configured)
-		return;
-	memset(pixel_data, 0, buffer_size);
 	wl_surface_damage(surf, 0, 0, bar_width, bar_height);
 	wl_surface_attach(surf, buf, 0, 0);
 	wl_surface_commit(surf);
@@ -476,7 +434,7 @@ ptr_leave(void *d, struct wl_pointer *p, uint32_t s, struct wl_surface *sf)
 		visible = 0;
 		arm_timer(0);
 		update_input_region();
-		clear_surface();
+		draw();
 	}
 }
 
@@ -499,14 +457,17 @@ ptr_btn(void *d, struct wl_pointer *p, uint32_t s, uint32_t t, uint32_t b, uint3
 static void
 ptr_axis(void *d, struct wl_pointer *p, uint32_t t, uint32_t a, wl_fixed_t val)
 {
+	int dlt;
+
 	if (val == 0)
 		return;
+	dlt = val < 0 ? 1 : -1;
 	if (pointer_x < bounds[0]) {
-		set_brightness_delta(val < 0 ? 1 : -1);
+		set_brightness_delta(dlt);
 		if (update_brightness() && visible)
 			draw();
 	} else if (pointer_x < bounds[1]) {
-		set_volume_delta(val < 0 ? 1 : -1);
+		set_volume_delta(dlt);
 		if (update_volume() && visible)
 			draw();
 	}
@@ -518,12 +479,9 @@ ls_cfg(void *d, struct zwlr_layer_surface_v1 *l, uint32_t s, uint32_t w, uint32_
 	zwlr_layer_surface_v1_ack_configure(l, s);
 	configured = 1;
 	update_input_region();
-	if (visible || !opt_autohide) {
+	if (visible || !opt_autohide)
 		update_all();
-		draw();
-	} else {
-		clear_surface();
-	}
+	draw();
 }
 
 static void
@@ -593,21 +551,6 @@ create_shm_buffer(void)
 	return 0;
 }
 
-static int
-setup_netlink(void)
-{
-	struct sockaddr_nl sa = { .nl_family = AF_NETLINK, .nl_groups = 1 };
-	int fd;
-
-	if ((fd = socket(AF_NETLINK, SOCK_RAW | SOCK_NONBLOCK | SOCK_CLOEXEC, NETLINK_KOBJECT_UEVENT)) < 0)
-		return -1;
-	if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
-		close(fd);
-		return -1;
-	}
-	return fd;
-}
-
 static void
 sig_handler(int sig)
 {
@@ -618,13 +561,19 @@ static void
 setup_wayland(void)
 {
 	static const uint32_t anchors[] = { 5, 9, 6, 10 };
-	struct sigaction sa = { .sa_handler = sig_handler };
+	struct sockaddr_nl sa = { .nl_family = AF_NETLINK, .nl_groups = 1 };
+	struct sigaction act = { .sa_handler = sig_handler };
 
-	sigaction(SIGINT, &sa, NULL);
-	sigaction(SIGTERM, &sa, NULL);
+	sigaction(SIGINT, &act, NULL);
+	sigaction(SIGTERM, &act, NULL);
 	setup_mixer();
 	timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
-	netlink_fd = setup_netlink();
+	if ((netlink_fd = socket(AF_NETLINK, SOCK_RAW | SOCK_NONBLOCK | SOCK_CLOEXEC, NETLINK_KOBJECT_UEVENT)) >= 0) {
+		if (bind(netlink_fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+			close(netlink_fd);
+			netlink_fd = -1;
+		}
+	}
 
 	if (!(dpy = wl_display_connect(NULL)))
 		die("cannot connect to wayland display");
@@ -671,12 +620,10 @@ main(int argc, char **argv)
 	while ((opt = getopt(argc, argv, "c:nhv")) >= 0) {
 		switch (opt) {
 		case 'c':
-			if (optarg[0] == 't')
-				selected_corner = optarg[1] == 'r' ? CORNER_TOP_RIGHT : CORNER_TOP_LEFT;
-			else if (optarg[0] == 'b')
-				selected_corner = optarg[1] == 'r' ? CORNER_BOTTOM_RIGHT : CORNER_BOTTOM_LEFT;
-			else if (optarg[0] >= '0' && optarg[0] <= '3')
+			if (optarg[0] >= '0' && optarg[0] <= '3')
 				selected_corner = optarg[0] - '0';
+			else
+				selected_corner = ((optarg[0] == 'b') << 1) | (optarg[1] == 'r');
 			break;
 		case 'n':
 			opt_autohide = 0;
@@ -734,36 +681,35 @@ main(int argc, char **argv)
 		wl_display_dispatch_pending(dpy);
 
 		if (timer_fd >= 0 && (pfds[1].revents & POLLIN)) {
-			if (read(timer_fd, &exp, sizeof(exp)) > 0 && update_clock() && visible)
-				draw();
+			if (read(timer_fd, &exp, sizeof(exp)) > 0)
+				dirty |= update_clock();
 		}
 		if (netlink_fd >= 0 && (pfds[2].revents & POLLIN)) {
 			ssize_t j, len;
 
 			while ((len = recv(netlink_fd, nlk, sizeof(nlk) - 1, 0)) > 0) {
-				nlk[len] = '\0';
 				for (j = 0; j < len; j++) {
 					if (nlk[j] == '\0')
 						nlk[j] = ' ';
 				}
+				nlk[len] = '\0';
 				if (strstr(nlk, "backlight"))
 					dirty |= update_brightness();
 				if (strstr(nlk, "power_supply"))
 					dirty |= update_battery();
 			}
-			if (dirty && visible)
-				draw();
 		}
 		if (mixer && alsa_count > 0) {
 			for (i = 0; i < alsa_count; i++) {
 				if (pfds[3 + i].revents) {
 					snd_mixer_handle_events(mixer);
-					if (update_volume() && visible)
-						draw();
+					dirty |= update_volume();
 					break;
 				}
 			}
 		}
+		if (dirty && visible)
+			draw();
 	}
 
 	cleanup();
