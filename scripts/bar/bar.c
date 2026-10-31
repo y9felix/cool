@@ -1,10 +1,10 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <alsa/asoundlib.h>
-#include <cairo/cairo.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/netlink.h>
+#include <math.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdint.h>
@@ -18,12 +18,11 @@
 #include <unistd.h>
 #include <wayland-client.h>
 
+#include "font.h"
 #include "wlr-layer-shell-unstable-v1-client-protocol.h"
 
 #define PI 3.14159265358979323846
-#define KAPPA 0.552285
 #define LEVEL(v, m) ((v) <= 0 ? 0 : (v) >= 100 ? (m) : ((v) * (m) + 50) / 100)
-#define SET_RGBA(cr, c) cairo_set_source_rgba(cr, (c)[0], (c)[1], (c)[2], (c)[3])
 #define BIND(iface) wl_registry_bind(r, n, &(iface), 1)
 
 enum {
@@ -45,8 +44,6 @@ static struct wl_surface *surf;
 static struct zwlr_layer_surface_v1 *ls;
 static struct wl_buffer *buf;
 static struct wl_pointer *ptr;
-static cairo_surface_t *back_surf;
-static cairo_t *back_cr;
 static snd_mixer_t *mixer;
 static snd_mixer_elem_t *mixer_elem;
 static void *pixel_data;
@@ -186,106 +183,262 @@ update_all(void)
 }
 
 static void
-rounded_rect(cairo_t *cr, double x0, double y0, double x1, double y1, double r)
+blend_pixel(int x, int y, uint32_t c, uint8_t a)
 {
-	cairo_new_sub_path(cr);
-	cairo_arc(cr, x1 - r, y0 + r, r, -PI / 2, 0);
-	cairo_arc(cr, x1 - r, y1 - r, r, 0, PI / 2);
-	cairo_arc(cr, x0 + r, y1 - r, r, PI / 2, PI);
-	cairo_arc(cr, x0 + r, y0 + r, r, PI, 3 * PI / 2);
-	cairo_close_path(cr);
-}
+	uint32_t *p, bg, fg_a, inv_a, r, g, b, out_a;
 
-static void
-draw_icon_brightness(cairo_t *cr, int lvl)
-{
-	double ax, c, r = 0.2975;
-
-	cairo_new_sub_path(cr);
-	cairo_arc(cr, 0.5, 0.5, 0.34, 0, 2 * PI);
-	cairo_set_line_width(cr, 0.085);
-	cairo_stroke(cr);
-	if (lvl > 0) {
-		ax = r * (lvl / 3.0 - 1.0);
-		c = KAPPA * r;
-		cairo_move_to(cr, 0.5, 0.5 - r);
-		cairo_curve_to(cr, 0.5 - c, 0.5 - r, 0.5 - r, 0.5 - c, 0.5 - r, 0.5);
-		cairo_curve_to(cr, 0.5 - r, 0.5 + c, 0.5 - c, 0.5 + r, 0.5, 0.5 + r);
-		cairo_curve_to(cr, 0.5 + KAPPA * ax, 0.5 + r, 0.5 + ax, 0.5 + c, 0.5 + ax, 0.5);
-		cairo_curve_to(cr, 0.5 + ax, 0.5 - c, 0.5 + KAPPA * ax, 0.5 - r, 0.5, 0.5 - r);
-		cairo_close_path(cr);
-		cairo_fill(cr);
+	if (x < 0 || x >= bar_width || y < 0 || y >= bar_height || !a)
+		return;
+	p = (uint32_t *)pixel_data + y * bar_width + x;
+	fg_a = (((c >> 24) & 0xff) * a) / 255;
+	if (!fg_a)
+		return;
+	if (fg_a >= 255) {
+		*p = c;
+		return;
 	}
+	bg = *p;
+	inv_a = 255 - fg_a;
+	out_a = fg_a + (((bg >> 24) & 0xff) * inv_a) / 255;
+	r = (((c >> 16) & 0xff) * fg_a + ((bg >> 16) & 0xff) * inv_a) / 255;
+	g = (((c >> 8) & 0xff) * fg_a + ((bg >> 8) & 0xff) * inv_a) / 255;
+	b = ((c & 0xff) * fg_a + (bg & 0xff) * inv_a) / 255;
+	*p = (out_a << 24) | (r << 16) | (g << 8) | b;
+}
+
+static int
+draw_string(int x, int y, const char *str, uint32_t color)
+{
+	int orig_x = x;
+
+	while (*str) {
+		int idx = ((unsigned char)*str >= 32 && (unsigned char)*str <= 126) ? ((unsigned char)*str - 32) : 0;
+		int row, col;
+
+		for (row = 0; row < FONT_HEIGHT; row++) {
+			for (col = 0; col < FONT_WIDTH; col++) {
+				uint8_t a = font_data[idx][row * FONT_WIDTH + col];
+				if (a)
+					blend_pixel(x + col, y + row, color, a);
+			}
+		}
+		x += FONT_WIDTH;
+		str++;
+	}
+	return x - orig_x;
 }
 
 static void
-draw_icon_volume(cairo_t *cr, int lvl, int muted)
+draw_line(double x0, double y0, double x1, double y1, uint32_t color, double th)
 {
-	int i;
+	int min_x = (int)(floor(fmin(x0, x1) - th - 1.0));
+	int max_x = (int)(ceil(fmax(x0, x1) + th + 1.0));
+	int min_y = (int)(floor(fmin(y0, y1) - th - 1.0));
+	int max_y = (int)(ceil(fmax(y0, y1) + th + 1.0));
+	double dx = x1 - x0, dy = y1 - y0;
+	double len_sq = dx * dx + dy * dy;
+	int x, y;
 
-	cairo_move_to(cr, 0.06, 0.38);
-	cairo_line_to(cr, 0.21, 0.38);
-	cairo_line_to(cr, 0.36, 0.18);
-	cairo_line_to(cr, 0.36, 0.82);
-	cairo_line_to(cr, 0.21, 0.62);
-	cairo_line_to(cr, 0.06, 0.62);
-	cairo_fill(cr);
-	cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
-	if (muted) {
-		cairo_set_line_width(cr, 0.08);
-		cairo_move_to(cr, 0.52, 0.36);
-		cairo_line_to(cr, 0.78, 0.64);
-		cairo_move_to(cr, 0.78, 0.36);
-		cairo_line_to(cr, 0.52, 0.64);
-		cairo_stroke(cr);
-	} else {
-		for (i = 0; i < 4; i++) {
-			cairo_set_line_width(cr, i < lvl ? 0.085 : 0.028);
-			cairo_new_sub_path(cr);
-			cairo_arc(cr, 0.34, 0.50, 0.14 + i * 0.14, -0.84, 0.84);
-			cairo_stroke(cr);
+	for (y = min_y; y <= max_y; y++) {
+		for (x = min_x; x <= max_x; x++) {
+			double t, px, py, d, a;
+
+			t = len_sq <= 0.0001 ? 0.0 : ((x + 0.5 - x0) * dx + (y + 0.5 - y0) * dy) / len_sq;
+			if (t < 0.0)
+				t = 0.0;
+			else if (t > 1.0)
+				t = 1.0;
+			px = x0 + t * dx;
+			py = y0 + t * dy;
+			d = hypot(x + 0.5 - px, y + 0.5 - py);
+			if (d < th / 2.0 + 0.5) {
+				a = 1.0 - (d - (th / 2.0 - 0.5));
+				if (a > 0.0)
+					blend_pixel(x, y, color, (uint8_t)((a > 1.0 ? 1.0 : a) * 255.0 + 0.5));
+			}
 		}
 	}
 }
 
 static void
-draw_icon_battery(cairo_t *cr, int lvl, int charging)
+draw_arc(double cx, double cy, double r, double a0, double a1, uint32_t color, double th)
 {
-	double filled;
+	int min_x = (int)(floor(cx - r - th - 1.0));
+	int max_x = (int)(ceil(cx + r + th + 1.0));
+	int min_y = (int)(floor(cy - r - th - 1.0));
+	int max_y = (int)(ceil(cy + r + th + 1.0));
+	int x, y;
 
-	rounded_rect(cr, 0.04, 0.188, 1.07, 0.812, 0.08);
-	cairo_set_line_width(cr, 0.08);
-	cairo_stroke(cr);
-	rounded_rect(cr, 1.12, 0.40, 1.23, 0.60, 0.03);
-	cairo_fill(cr);
-	filled = 0.10 + 0.91 * (lvl + 1) / 6.0;
-	rounded_rect(cr, 0.10, 0.248, filled, 0.752, 0.03);
-	if (charging) {
-		cairo_move_to(cr, 0.6705, 0.278);
-		cairo_line_to(cr, 0.345, 0.5222);
-		cairo_line_to(cr, 0.513, 0.5222);
-		cairo_line_to(cr, 0.4605, 0.722);
-		cairo_line_to(cr, 0.765, 0.4667);
-		cairo_line_to(cr, 0.597, 0.4667);
-		cairo_close_path(cr);
-		cairo_set_fill_rule(cr, CAIRO_FILL_RULE_EVEN_ODD);
+	for (y = min_y; y <= max_y; y++) {
+		for (x = min_x; x <= max_x; x++) {
+			double dx = x + 0.5 - cx;
+			double dy = y + 0.5 - cy;
+			double d = hypot(dx, dy);
+			double a = atan2(dy, dx);
+
+			if ((a0 <= -PI && a1 >= PI) || (a >= a0 && a <= a1)) {
+				double dist = fabs(d - r);
+
+				if (dist < th / 2.0 + 0.5) {
+					double cov = 1.0 - (dist - (th / 2.0 - 0.5));
+
+					if (cov > 0.0)
+						blend_pixel(x, y, color, (uint8_t)((cov > 1.0 ? 1.0 : cov) * 255.0 + 0.5));
+				}
+			}
+		}
 	}
-	cairo_fill(cr);
 }
 
 static void
-draw_icon_clock(cairo_t *cr)
+draw_rounded_rect(double x0, double y0, double w, double h, double r, uint32_t color, double th, int fill)
 {
-	cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
-	cairo_set_line_join(cr, CAIRO_LINE_JOIN_ROUND);
-	cairo_set_line_width(cr, 0.08);
-	cairo_new_sub_path(cr);
-	cairo_arc(cr, 0.5, 0.5, 0.34, 0, 2 * PI);
-	cairo_stroke(cr);
-	cairo_move_to(cr, 0.5, 0.28);
-	cairo_line_to(cr, 0.5, 0.5);
-	cairo_line_to(cr, 0.66, 0.58);
-	cairo_stroke(cr);
+	int min_x = (int)(floor(x0 - th - 1.0));
+	int max_x = (int)(ceil(x0 + w + th + 1.0));
+	int min_y = (int)(floor(y0 - th - 1.0));
+	int max_y = (int)(ceil(y0 + h + th + 1.0));
+	int x, y;
+
+	for (y = min_y; y <= max_y; y++) {
+		for (x = min_x; x <= max_x; x++) {
+			double px = (x + 0.5) - (x0 + w / 2.0);
+			double py = (y + 0.5) - (y0 + h / 2.0);
+			double qx = fabs(px) - (w / 2.0 - r);
+			double qy = fabs(py) - (h / 2.0 - r);
+			double mx = qx > 0.0 ? qx : 0.0;
+			double my = qy > 0.0 ? qy : 0.0;
+			double inner = (qx > qy ? qx : qy);
+			double d = sqrt(mx * mx + my * my) + (inner > 0.0 ? 0.0 : inner) - r;
+			double cov = fill ? (d < 0.5 ? 0.5 - d : 0.0)
+			                  : (fabs(d) < th / 2.0 + 0.5 ? 1.0 - (fabs(d) - (th / 2.0 - 0.5)) : 0.0);
+
+			if (cov > 0.0)
+				blend_pixel(x, y, color, (uint8_t)((cov > 1.0 ? 1.0 : cov) * 255.0 + 0.5));
+		}
+	}
+}
+
+static int
+point_in_poly(double px, double py, double pts[][2], int n)
+{
+	int i, j, c = 0;
+
+	for (i = 0, j = n - 1; i < n; j = i++) {
+		if (((pts[i][1] > py) != (pts[j][1] > py)) &&
+		    (px < (pts[j][0] - pts[i][0]) * (py - pts[i][1]) / (pts[j][1] - pts[i][1]) + pts[i][0]))
+			c = !c;
+	}
+	return c;
+}
+
+static void
+draw_poly(double pts[][2], int n, uint32_t color)
+{
+	double min_x = pts[0][0], max_x = pts[0][0], min_y = pts[0][1], max_y = pts[0][1];
+	int i, x, y;
+
+	for (i = 1; i < n; i++) {
+		if (pts[i][0] < min_x)
+			min_x = pts[i][0];
+		if (pts[i][0] > max_x)
+			max_x = pts[i][0];
+		if (pts[i][1] < min_y)
+			min_y = pts[i][1];
+		if (pts[i][1] > max_y)
+			max_y = pts[i][1];
+	}
+	for (y = (int)floor(min_y); y <= (int)ceil(max_y); y++) {
+		for (x = (int)floor(min_x); x <= (int)ceil(max_x); x++) {
+			int hits = point_in_poly(x + 0.25, y + 0.25, pts, n)
+			         + point_in_poly(x + 0.75, y + 0.25, pts, n)
+			         + point_in_poly(x + 0.25, y + 0.75, pts, n)
+			         + point_in_poly(x + 0.75, y + 0.75, pts, n);
+
+			if (hits > 0)
+				blend_pixel(x, y, color, (uint8_t)(hits * 63.75 + 0.5));
+		}
+	}
+}
+
+static void
+draw_icon_brightness(int x, int y, int lvl, uint32_t color)
+{
+	double cx = x + 10.0, cy = y + 10.0, r = 5.95;
+	double ax = r * ((double)lvl / 3.0 - 1.0);
+	int px, py;
+
+	draw_arc(cx, cy, 6.8, -PI, PI, color, 1.7);
+	if (lvl <= 0)
+		return;
+	for (py = (int)floor(cy - r - 1.0); py <= (int)ceil(cy + r + 1.0); py++) {
+		for (px = (int)floor(cx - r - 1.0); px <= (int)ceil(cx + r + 1.0); px++) {
+			double dx = px + 0.5 - cx;
+			double dy = py + 0.5 - cy;
+
+			if (fabs(dy) < r) {
+				double w = sqrt(1.0 - (dy / r) * (dy / r));
+
+				if (dx >= -r * w && dx <= ax * w) {
+					double d = hypot(dx, dy);
+					double cov = 1.0;
+
+					if (d > r - 0.5)
+						cov = 1.0 - (d - (r - 0.5));
+					if (cov > 1.0)
+						cov = 1.0;
+					if (cov > 0.0)
+						blend_pixel(px, py, color, (uint8_t)(cov * 255.0 + 0.5));
+				}
+			}
+		}
+	}
+}
+
+static void
+draw_icon_volume(int x, int y, int lvl, int muted, uint32_t color)
+{
+	double pts[6][2] = {
+		{ x + 1.2, y + 7.6 }, { x + 4.2, y + 7.6 }, { x + 7.2, y + 3.6 },
+		{ x + 7.2, y + 16.4 }, { x + 4.2, y + 12.4 }, { x + 1.2, y + 12.4 }
+	};
+	int i;
+
+	draw_poly(pts, 6, color);
+	if (muted) {
+		draw_line(x + 10.4, y + 7.2, x + 15.6, y + 12.8, color, 1.6);
+		draw_line(x + 15.6, y + 7.2, x + 10.4, y + 12.8, color, 1.6);
+	} else {
+		for (i = 0; i < 4; i++) {
+			double r = (0.14 + i * 0.14) * 20.0;
+			double th = (i < lvl ? 1.7 : 0.6);
+
+			draw_arc(x + 6.8, y + 10.0, r, -0.84, 0.84, color, th);
+		}
+	}
+}
+
+static void
+draw_icon_battery(int x, int y, int lvl, int chg, uint32_t color)
+{
+	double filled_w = 2.0 + (18.2 * (lvl + 1)) / 6.0;
+	double bolt[6][2] = {
+		{ x + 13.41, y + 5.56 }, { x + 6.90, y + 10.44 }, { x + 10.26, y + 10.44 },
+		{ x + 9.21, y + 14.44 }, { x + 15.30, y + 9.33 }, { x + 11.94, y + 9.33 }
+	};
+
+	draw_rounded_rect(x + 0.8, y + 3.8, 20.6, 12.4, 1.6, color, 1.6, 0);
+	draw_rounded_rect(x + 22.4, y + 8.0, 2.2, 4.0, 0.6, color, 0, 1);
+	draw_rounded_rect(x + 2.0, y + 5.0, filled_w, 10.0, 0.6, color, 0, 1);
+	if (chg)
+		draw_poly(bolt, 6, color_bg);
+}
+
+static void
+draw_icon_clock(int x, int y, uint32_t color)
+{
+	draw_arc(x + 10.0, y + 10.0, 6.8, -PI, PI, color, 1.6);
+	draw_line(x + 10.0, y + 10.0, x + 10.0, y + 5.6, color, 1.6);
+	draw_line(x + 10.0, y + 10.0, x + 13.2, y + 11.6, color, 1.6);
 }
 
 static void
@@ -309,70 +462,55 @@ update_input_region(void)
 static void
 draw(void)
 {
-	cairo_font_extents_t fext;
-	cairo_text_extents_t text;
 	char mod_text[32];
-	int icon_y, iw, x, y;
+	uint32_t color, *p;
+	int icon_y, iw, text_y, x;
 	size_t i;
 
-	if (!back_cr || !configured)
+	if (!configured || !pixel_data)
 		return;
 	if (opt_autohide && !visible) {
 		memset(pixel_data, 0, buffer_size);
 	} else {
-		cairo_new_path(back_cr);
-		cairo_set_operator(back_cr, CAIRO_OPERATOR_SOURCE);
-		SET_RGBA(back_cr, color_bg);
-		cairo_paint(back_cr);
-		cairo_set_operator(back_cr, CAIRO_OPERATOR_OVER);
+		p = (uint32_t *)pixel_data;
+		for (i = 0; i < (size_t)bar_width * bar_height; i++)
+			p[i] = color_bg;
 
 		x = padding_x;
 		icon_y = (bar_height - icon_size) / 2;
 		if (icon_y < 0)
 			icon_y = 0;
-		cairo_font_extents(back_cr, &fext);
-		y = (bar_height - (int)(fext.height + 0.5)) / 2 + (int)(fext.ascent + 0.5);
+		text_y = (bar_height - FONT_HEIGHT) / 2;
 
 		for (i = 0; i < 4; i++) {
-			SET_RGBA(back_cr, color_fg);
+			color = color_fg;
 			iw = icon_size;
-			cairo_new_path(back_cr);
-			cairo_save(back_cr);
-			cairo_translate(back_cr, x, icon_y);
-			cairo_scale(back_cr, icon_size, icon_size);
 			switch (i) {
 			case 0:
-				draw_icon_brightness(back_cr, LEVEL(cur_bri, 6));
+				draw_icon_brightness(x, icon_y, LEVEL(cur_bri, 6), color);
 				snprintf(mod_text, sizeof(mod_text), "%d%%", cur_bri < 0 ? 0 : cur_bri);
 				break;
 			case 1:
 				if (cur_mute)
-					SET_RGBA(back_cr, color_disabled);
-				draw_icon_volume(back_cr, LEVEL(cur_vol, 4), cur_mute);
+					color = color_disabled;
+				draw_icon_volume(x, icon_y, LEVEL(cur_vol, 4), cur_mute, color);
 				snprintf(mod_text, sizeof(mod_text), "%d%%", cur_vol < 0 ? 0 : cur_vol);
 				break;
 			case 2:
 				iw = (int)(1.25 * icon_size + 0.5);
-				draw_icon_battery(back_cr, LEVEL(cur_bat, 5), cur_chg);
+				draw_icon_battery(x, icon_y, LEVEL(cur_bat, 5), cur_chg, color);
 				snprintf(mod_text, sizeof(mod_text), "%d%%", cur_bat < 0 ? 0 : cur_bat);
 				break;
 			case 3:
-				draw_icon_clock(back_cr);
+				draw_icon_clock(x, icon_y, color);
 				snprintf(mod_text, sizeof(mod_text), "%s", cur_time);
 				break;
 			}
-			cairo_restore(back_cr);
-			cairo_new_path(back_cr);
 			x += iw + icon_spacing;
-			cairo_text_extents(back_cr, mod_text, &text);
-			cairo_move_to(back_cr, x, y);
-			cairo_show_text(back_cr, mod_text);
-			cairo_new_path(back_cr);
-			x += (int)(text.x_advance + 0.5) + spacing;
+			x += draw_string(x, text_y, mod_text, color) + spacing;
 			if (i < 2)
 				bounds[i] = x;
 		}
-		cairo_surface_flush(back_surf);
 	}
 	wl_surface_damage(surf, 0, 0, bar_width, bar_height);
 	wl_surface_attach(surf, buf, 0, 0);
@@ -434,7 +572,7 @@ ptr_btn(void *d, struct wl_pointer *p, uint32_t s, uint32_t t, uint32_t b, uint3
 }
 
 static void
-noop()
+noop(void *d, struct wl_pointer *p, uint32_t a, uint32_t b, wl_fixed_t c)
 {
 }
 
@@ -508,11 +646,6 @@ create_shm_buffer(void)
 	buf = wl_shm_pool_create_buffer(pool, 0, bar_width, bar_height, bar_width * 4, WL_SHM_FORMAT_ARGB8888);
 	wl_shm_pool_destroy(pool);
 	close(fd);
-
-	back_surf = cairo_image_surface_create_for_data(pixel_data, CAIRO_FORMAT_ARGB32, bar_width, bar_height, bar_width * 4);
-	back_cr = cairo_create(back_surf);
-	cairo_select_font_face(back_cr, font_family, CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-	cairo_set_font_size(back_cr, font_size);
 	return 0;
 }
 
@@ -564,10 +697,6 @@ cleanup(void)
 		close(timer_fd);
 	if (netlink_fd >= 0)
 		close(netlink_fd);
-	if (back_cr)
-		cairo_destroy(back_cr);
-	if (back_surf)
-		cairo_surface_destroy(back_surf);
 	if (mixer)
 		snd_mixer_close(mixer);
 	if (ls)
