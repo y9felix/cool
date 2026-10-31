@@ -50,7 +50,7 @@ static void *pixel_data;
 static size_t buffer_size;
 static int timer_fd = -1, netlink_fd = -1, cur_bri = -1, cur_vol = -1;
 static int cur_mute = -1, cur_bat = -1, cur_chg = -1, selected_corner = corner;
-static int opt_autohide = autohide, visible, configured, pointer_x, bounds[2];
+static int opt_autohide = autohide, visible, configured;
 static char cur_time[32];
 static volatile sig_atomic_t running = 1;
 
@@ -474,8 +474,6 @@ draw(void)
 			}
 			x += iw + icon_spacing;
 			x += draw_string(x, text_y, mod_text, color) + spacing;
-			if (i < 2)
-				bounds[i] = x;
 		}
 	}
 	wl_surface_damage(surf, 0, 0, bar_width, bar_height);
@@ -513,7 +511,6 @@ set_visibility(int v)
 static void
 ptr_enter(void *d, struct wl_pointer *p, uint32_t s, struct wl_surface *sf, wl_fixed_t sx, wl_fixed_t sy)
 {
-	pointer_x = wl_fixed_to_int(sx);
 	set_visibility(1);
 }
 
@@ -527,20 +524,11 @@ ptr_leave(void *d, struct wl_pointer *p, uint32_t s, struct wl_surface *sf)
 static void
 ptr_motion(void *d, struct wl_pointer *p, uint32_t t, wl_fixed_t sx, wl_fixed_t sy)
 {
-	pointer_x = wl_fixed_to_int(sx);
 }
 
 static void
 ptr_btn(void *d, struct wl_pointer *p, uint32_t s, uint32_t t, uint32_t b, uint32_t st)
 {
-	int sw;
-
-	if (st && b == 0x110 && pointer_x >= bounds[0] && pointer_x < bounds[1] && mixer_elem) {
-		snd_mixer_selem_get_playback_switch(mixer_elem, SND_MIXER_SCHN_MONO, &sw);
-		snd_mixer_selem_set_playback_switch_all(mixer_elem, !sw);
-		if (update_volume() && visible)
-			draw();
-	}
 }
 
 static void
