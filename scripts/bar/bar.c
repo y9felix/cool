@@ -85,12 +85,6 @@ read_sysfs(const char *base, const char *entry, char *out, size_t sz)
 	return atoi(b);
 }
 
-static void
-set_brightness_delta(int delta)
-{
-	system(delta > 0 ? "brightnessctl -q set 5%+ >/dev/null 2>&1" : "brightnessctl -q set 5%- >/dev/null 2>&1");
-}
-
 static int
 update_brightness(void)
 {
@@ -121,20 +115,6 @@ setup_mixer(void)
 	snd_mixer_selem_id_set_name(sid, alsa_mixer);
 	mixer_elem = snd_mixer_find_selem(mixer, sid);
 	snd_mixer_selem_id_free(sid);
-}
-
-static void
-set_volume_delta(int delta)
-{
-	long min, max, vol, step;
-
-	if (!mixer_elem)
-		return;
-	snd_mixer_selem_get_playback_volume_range(mixer_elem, &min, &max);
-	snd_mixer_selem_get_playback_volume(mixer_elem, SND_MIXER_SCHN_MONO, &vol);
-	step = (max - min) / 20;
-	vol += delta * (step > 0 ? step : 1);
-	snd_mixer_selem_set_playback_volume_all(mixer_elem, vol < min ? min : vol > max ? max : vol);
 }
 
 static void
@@ -393,7 +373,6 @@ draw(void)
 				bounds[i] = x;
 		}
 		cairo_surface_flush(back_surf);
-		memcpy(pixel_data, cairo_image_surface_get_data(back_surf), buffer_size);
 	}
 	wl_surface_damage(surf, 0, 0, bar_width, bar_height);
 	wl_surface_attach(surf, buf, 0, 0);
@@ -455,22 +434,8 @@ ptr_btn(void *d, struct wl_pointer *p, uint32_t s, uint32_t t, uint32_t b, uint3
 }
 
 static void
-ptr_axis(void *d, struct wl_pointer *p, uint32_t t, uint32_t a, wl_fixed_t val)
+noop()
 {
-	int dlt;
-
-	if (val == 0)
-		return;
-	dlt = val < 0 ? 1 : -1;
-	if (pointer_x < bounds[0]) {
-		set_brightness_delta(dlt);
-		if (update_brightness() && visible)
-			draw();
-	} else if (pointer_x < bounds[1]) {
-		set_volume_delta(dlt);
-		if (update_volume() && visible)
-			draw();
-	}
 }
 
 static void
@@ -492,7 +457,7 @@ ls_closed(void *d, struct zwlr_layer_surface_v1 *l)
 
 static const struct wl_pointer_listener ptr_l = {
 	.enter = ptr_enter, .leave = ptr_leave, .motion = ptr_motion,
-	.button = ptr_btn, .axis = ptr_axis
+	.button = ptr_btn, .axis = noop
 };
 static const struct zwlr_layer_surface_v1_listener ls_l = { .configure = ls_cfg, .closed = ls_closed };
 
@@ -544,7 +509,7 @@ create_shm_buffer(void)
 	wl_shm_pool_destroy(pool);
 	close(fd);
 
-	back_surf = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, bar_width, bar_height);
+	back_surf = cairo_image_surface_create_for_data(pixel_data, CAIRO_FORMAT_ARGB32, bar_width, bar_height, bar_width * 4);
 	back_cr = cairo_create(back_surf);
 	cairo_select_font_face(back_cr, font_family, CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
 	cairo_set_font_size(back_cr, font_size);
