@@ -181,6 +181,28 @@ update_all(void)
 	update_clock();
 }
 
+static int
+handle_uevent(void)
+{
+	char nlk[1024];
+	ssize_t j, len;
+	int dirty;
+
+	dirty = 0;
+	while ((len = recv(netlink_fd, nlk, sizeof(nlk) - 1, 0)) > 0) {
+		for (j = 0; j < len; j++) {
+			if (nlk[j] == '\0')
+				nlk[j] = ' ';
+		}
+		nlk[len] = '\0';
+		if (strstr(nlk, "backlight"))
+			dirty |= update_brightness();
+		if (strstr(nlk, "power_supply"))
+			dirty |= update_battery();
+	}
+	return dirty;
+}
+
 static void
 blend_pixel(int x, int y, uint32_t c, uint8_t a)
 {
@@ -268,10 +290,9 @@ draw_arc(double cx, double cy, double r, double a0, double a1, uint32_t color, d
 			dx = x + 0.5 - cx;
 			dy = y + 0.5 - cy;
 			d = hypot(dx, dy);
-			a = atan2(dy, dx);
-			if ((a0 <= -PI && a1 >= PI) || (a >= a0 && a <= a1)) {
-				dist = fabs(d - r);
-				if (dist < th / 2.0 + 0.5) {
+			dist = fabs(d - r);
+			if (dist < th / 2.0 + 0.5) {
+				if ((a0 <= -PI && a1 >= PI) || ((a = atan2(dy, dx)) >= a0 && a <= a1)) {
 					cov = 1.0 - (dist - (th / 2.0 - 0.5));
 					if (cov > 0.0)
 						blend_pixel(x, y, color, (uint8_t)((cov > 1.0 ? 1.0 : cov) * 255.0 + 0.5));
@@ -366,8 +387,8 @@ draw_icon_brightness(int x, int y, int lvl, uint32_t color)
 	draw_arc(cx, cy, 6.8, -PI, PI, color, 1.7);
 	if (lvl <= 0)
 		return;
-	for (py = (int)floor(cy - r - 1.0); py <= (int)ceil(cy + r + 1.0); py++) {
-		for (px = (int)floor(cx - r - 1.0); px <= (int)ceil(cx + r + 1.0); px++) {
+	for (py = y + 3; py <= y + 17; py++) {
+		for (px = x + 3; px <= x + 17; px++) {
 			dx = px + 0.5 - cx;
 			dy = py + 0.5 - cy;
 			if (fabs(dy) < r) {
@@ -398,7 +419,7 @@ draw_icon_volume(int x, int y, int lvl, int muted, uint32_t color)
 		draw_line(x + 15.6, y + 7.2, x + 10.4, y + 12.8, color, 1.6);
 	} else {
 		for (i = 0; i < 4; i++)
-			draw_arc(x + 6.8, y + 10.0, (0.14 + i * 0.14) * 20.0, -0.84, 0.84, color, i < lvl ? 1.7 : 0.6);
+			draw_arc(x + 6.8, y + 10.0, 2.8 + i * 2.8, -0.84, 0.84, color, i < lvl ? 1.7 : 0.6);
 	}
 }
 
@@ -465,28 +486,26 @@ draw(void)
 			switch (i) {
 			case 0:
 				draw_icon_brightness(x, icon_y, LEVEL(cur_bri, 6), color);
-				snprintf(mod_text, sizeof(mod_text), "%d%%", cur_bri);
 				break;
 			case 1:
 				if (cur_mute)
 					color = color_disabled;
 				draw_icon_volume(x, icon_y, LEVEL(cur_vol, 4), cur_mute, color);
-				snprintf(mod_text, sizeof(mod_text), "%d%%", cur_vol);
 				break;
 			case 2:
 				iw = (int)(1.25 * icon_size + 0.5);
 				draw_icon_battery(x, icon_y, cur_bat, cur_chg, color);
-				snprintf(mod_text, sizeof(mod_text), "%d%%", cur_bat);
 				break;
 			case 3:
 				draw_arc(x + 10.0, icon_y + 10.0, 6.8, -PI, PI, color, 1.6);
 				draw_line(x + 10.0, icon_y + 10.0, x + 10.0, icon_y + 5.6, color, 1.6);
 				draw_line(x + 10.0, icon_y + 10.0, x + 13.2, icon_y + 11.6, color, 1.6);
-				snprintf(mod_text, sizeof(mod_text), "%s", cur_time);
 				break;
 			}
+			if (i < 3)
+				snprintf(mod_text, sizeof(mod_text), "%d%%", i == 0 ? cur_bri : (i == 1 ? cur_vol : cur_bat));
 			x += iw + icon_spacing;
-			x += draw_string(x, text_y, mod_text, color) + spacing;
+			x += draw_string(x, text_y, i < 3 ? mod_text : cur_time, color) + spacing;
 		}
 	}
 	wl_surface_damage(surf, 0, 0, bar_width, bar_height);
@@ -500,7 +519,9 @@ arm_timer(int enable)
 	struct itimerspec its = {{0, 0}, {0, 0}};
 	struct timespec ts;
 
-	if (timer_fd >= 0 && enable) {
+	if (timer_fd < 0)
+		return;
+	if (enable) {
 		clock_gettime(CLOCK_REALTIME, &ts);
 		its.it_value.tv_nsec = 1000000000L - ts.tv_nsec;
 		its.it_interval.tv_sec = 1;
@@ -511,14 +532,14 @@ arm_timer(int enable)
 static void
 set_visibility(int v)
 {
-	if (visible != v) {
-		visible = v;
-		arm_timer(v);
-		update_input_region();
-		if (v)
-			update_all();
-		draw();
-	}
+	if (visible == v)
+		return;
+	visible = v;
+	arm_timer(v);
+	update_input_region();
+	if (v)
+		update_all();
+	draw();
 }
 
 static void
@@ -638,11 +659,10 @@ setup_wayland(void)
 	signal(SIGTERM, sig_handler);
 	setup_mixer();
 	timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
-	if ((netlink_fd = socket(AF_NETLINK, SOCK_RAW | SOCK_NONBLOCK | SOCK_CLOEXEC, NETLINK_KOBJECT_UEVENT)) >= 0) {
-		if (bind(netlink_fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
-			close(netlink_fd);
-			netlink_fd = -1;
-		}
+	if ((netlink_fd = socket(AF_NETLINK, SOCK_RAW | SOCK_NONBLOCK | SOCK_CLOEXEC, NETLINK_KOBJECT_UEVENT)) >= 0 &&
+	    bind(netlink_fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+		close(netlink_fd);
+		netlink_fd = -1;
 	}
 
 	if (!(dpy = wl_display_connect(NULL)))
@@ -682,8 +702,6 @@ main(int argc, char **argv)
 {
 	struct pollfd pfds[8];
 	uint64_t exp;
-	ssize_t j, len;
-	char nlk[1024];
 	int alsa_count, dirty, i, nfds, opt;
 
 	alsa_count = 0;
@@ -749,31 +767,16 @@ main(int argc, char **argv)
 			wl_display_cancel_read(dpy);
 		wl_display_dispatch_pending(dpy);
 
-		if (timer_fd >= 0 && (pfds[1].revents & POLLIN)) {
-			if (read(timer_fd, &exp, sizeof(exp)) > 0)
-				dirty |= update_clock();
-		}
-		if (netlink_fd >= 0 && (pfds[2].revents & POLLIN)) {
-			while ((len = recv(netlink_fd, nlk, sizeof(nlk) - 1, 0)) > 0) {
-				for (j = 0; j < len; j++) {
-					if (nlk[j] == '\0')
-						nlk[j] = ' ';
-				}
-				nlk[len] = '\0';
-				if (strstr(nlk, "backlight"))
-					dirty |= update_brightness();
-				if (strstr(nlk, "power_supply"))
-					dirty |= update_battery();
-			}
-		}
-		if (mixer && alsa_count > 0) {
-			for (i = 0; i < alsa_count; i++) {
-				if (pfds[3 + i].revents) {
-					if (snd_mixer_handle_events(mixer) < 0)
-						setup_mixer();
-					dirty |= update_volume();
-					break;
-				}
+		if (timer_fd >= 0 && (pfds[1].revents & POLLIN) && read(timer_fd, &exp, sizeof(exp)) > 0)
+			dirty |= update_clock();
+		if (netlink_fd >= 0 && (pfds[2].revents & POLLIN))
+			dirty |= handle_uevent();
+		for (i = 0; i < alsa_count; i++) {
+			if (pfds[3 + i].revents) {
+				if (snd_mixer_handle_events(mixer) < 0)
+					setup_mixer();
+				dirty |= update_volume();
+				break;
 			}
 		}
 		if (dirty && visible)
