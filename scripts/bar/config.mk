@@ -1,7 +1,7 @@
 VERSION = 1.0
 PREFIX = /usr/local
 
-CC = ccache gcc
+CC = cc
 WAYLAND_SCANNER = wayland-scanner
 
 PKGS = wayland-client alsa
