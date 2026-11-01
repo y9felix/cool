@@ -97,6 +97,11 @@ setup_mixer(void)
 {
 	snd_mixer_selem_id_t *sid;
 
+	if (mixer) {
+		snd_mixer_close(mixer);
+		mixer = NULL;
+		mixer_elem = NULL;
+	}
 	if (snd_mixer_open(&mixer, 0) < 0)
 		return;
 	if (snd_mixer_attach(mixer, alsa_device) < 0 || snd_mixer_selem_register(mixer, NULL, NULL) < 0 ||
@@ -116,11 +121,18 @@ update_volume(void)
 	long max, min, vol;
 	int muted, sw, v;
 
-	if (!mixer_elem)
-		return 0;
+	if (!mixer_elem) {
+		setup_mixer();
+		if (!mixer_elem)
+			return 0;
+	}
 	sw = 1;
-	snd_mixer_selem_get_playback_volume_range(mixer_elem, &min, &max);
-	snd_mixer_selem_get_playback_volume(mixer_elem, SND_MIXER_SCHN_MONO, &vol);
+	vol = min = max = 0;
+	if (snd_mixer_selem_get_playback_volume_range(mixer_elem, &min, &max) < 0 ||
+	    snd_mixer_selem_get_playback_volume(mixer_elem, SND_MIXER_SCHN_MONO, &vol) < 0) {
+		setup_mixer();
+		return 0;
+	}
 	snd_mixer_selem_get_playback_switch(mixer_elem, SND_MIXER_SCHN_MONO, &sw);
 	muted = !sw;
 	v = max > min ? (vol - min) * 100 / (max - min) : 0;
@@ -391,7 +403,7 @@ draw_icon_volume(int x, int y, int lvl, int muted, uint32_t color)
 }
 
 static void
-draw_icon_battery(int x, int y, int lvl, int chg, uint32_t color)
+draw_icon_battery(int x, int y, int pct, int chg, uint32_t color)
 {
 	double bolt[6][2] = {
 		{ x + 13.41, y + 5.56 }, { x + 6.90, y + 10.44 }, { x + 10.26, y + 10.44 },
@@ -400,7 +412,8 @@ draw_icon_battery(int x, int y, int lvl, int chg, uint32_t color)
 
 	draw_rounded_rect(x + 0.8, y + 3.8, 20.6, 12.4, 1.6, color, 1.6, 0);
 	draw_rounded_rect(x + 22.4, y + 8.0, 2.2, 4.0, 0.6, color, 0, 1);
-	draw_rounded_rect(x + 2.0, y + 5.0, 2.0 + (18.2 * (lvl + 1)) / 6.0, 10.0, 0.6, color, 0, 1);
+	if (pct > 0)
+		draw_rounded_rect(x + 2.0, y + 5.0, (18.2 * (pct > 100 ? 100 : pct)) / 100.0, 10.0, 0.6, color, 0, 1);
 	if (chg)
 		draw_poly(bolt, 6, color_bg);
 }
@@ -462,7 +475,7 @@ draw(void)
 				break;
 			case 2:
 				iw = (int)(1.25 * icon_size + 0.5);
-				draw_icon_battery(x, icon_y, LEVEL(cur_bat, 5), cur_chg, color);
+				draw_icon_battery(x, icon_y, cur_bat, cur_chg, color);
 				snprintf(mod_text, sizeof(mod_text), "%d%%", cur_bat);
 				break;
 			case 3:
@@ -703,20 +716,22 @@ main(int argc, char **argv)
 	pfds[0] = (struct pollfd){ wl_display_get_fd(dpy), POLLIN, 0 };
 	pfds[1] = (struct pollfd){ timer_fd, POLLIN, 0 };
 	pfds[2] = (struct pollfd){ netlink_fd, POLLIN, 0 };
-	nfds = 3;
-
-	if (mixer) {
-		alsa_count = snd_mixer_poll_descriptors_count(mixer);
-		if (alsa_count > 0 && alsa_count <= 5) {
-			snd_mixer_poll_descriptors(mixer, &pfds[3], alsa_count);
-			nfds += alsa_count;
-		} else {
-			alsa_count = 0;
-		}
-	}
 
 	while (running) {
 		dirty = 0;
+		nfds = 3;
+		if (!mixer_elem)
+			dirty |= update_volume();
+		if (mixer) {
+			alsa_count = snd_mixer_poll_descriptors_count(mixer);
+			if (alsa_count > 0 && alsa_count <= 5) {
+				snd_mixer_poll_descriptors(mixer, &pfds[3], alsa_count);
+				nfds += alsa_count;
+			} else {
+				alsa_count = 0;
+			}
+		}
+
 		while (wl_display_prepare_read(dpy) < 0)
 			wl_display_dispatch_pending(dpy);
 		wl_display_flush(dpy);
@@ -754,7 +769,8 @@ main(int argc, char **argv)
 		if (mixer && alsa_count > 0) {
 			for (i = 0; i < alsa_count; i++) {
 				if (pfds[3 + i].revents) {
-					snd_mixer_handle_events(mixer);
+					if (snd_mixer_handle_events(mixer) < 0)
+						setup_mixer();
 					dirty |= update_volume();
 					break;
 				}
