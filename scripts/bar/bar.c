@@ -430,13 +430,30 @@ draw_icon_battery(int x, int y, int pct, int chg, uint32_t color)
 		{ x + 13.41, y + 5.56 }, { x + 6.90, y + 10.44 }, { x + 10.26, y + 10.44 },
 		{ x + 9.21, y + 14.44 }, { x + 15.30, y + 9.33 }, { x + 11.94, y + 9.33 }
 	};
+	double bw, bx1, sx, sy;
+	int hits, px, py, si, sj;
 
 	draw_rounded_rect(x + 0.8, y + 3.8, 20.6, 12.4, 1.6, color, 1.6, 0);
 	draw_rounded_rect(x + 22.4, y + 8.0, 2.2, 4.0, 0.6, color, 0, 1);
-	if (pct > 0)
-		draw_rounded_rect(x + 2.0, y + 5.0, (18.2 * (pct > 100 ? 100 : pct)) / 100.0, 10.0, 0.6, color, 0, 1);
-	if (chg)
-		draw_poly(bolt, 6, color_bg);
+	bw = pct <= 0 ? 0 : (18.2 * (pct > 100 ? 100 : pct)) / 100.0;
+	bx1 = x + 2.0 + bw;
+	if (bw > 0 || chg) {
+		for (py = y + 5; py <= y + 14; py++) {
+			for (px = x + 2; px <= x + 20; px++) {
+				hits = 0;
+				for (si = 0; si < 2; si++) {
+					for (sj = 0; sj < 2; sj++) {
+						sx = px + 0.25 + sj * 0.5;
+						sy = py + 0.25 + si * 0.5;
+						if ((bw > 0 && sx <= bx1) ^ (chg && point_in_poly(sx, sy, bolt, 6)))
+							hits++;
+					}
+				}
+				if (hits > 0)
+					blend_pixel(px, py, color, (uint8_t)(hits * 63.75 + 0.5));
+			}
+		}
+	}
 }
 
 static void
