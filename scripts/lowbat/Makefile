@@ -35,12 +35,8 @@ install: all
 	mkdir -p $(DESTDIR)$(PREFIX)/bin
 	cp -f lowbat $(DESTDIR)$(PREFIX)/bin
 	chmod 755 $(DESTDIR)$(PREFIX)/bin/lowbat
-	mkdir -p $(DESTDIR)$(MANPREFIX)/man1
-	cp -f lowbat.1 $(DESTDIR)$(MANPREFIX)/man1/lowbat.1
-	chmod 644 $(DESTDIR)$(MANPREFIX)/man1/lowbat.1
 
 uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/bin/lowbat
-	rm -f $(DESTDIR)$(MANPREFIX)/man1/lowbat.1
 
 .PHONY: all clean install uninstall
