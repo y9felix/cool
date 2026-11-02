@@ -1,6 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 
-#include <alsa/asoundlib.h>
+#include <sys/un.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/netlink.h>
@@ -36,7 +36,6 @@ enum {
 static void arm_timer(int enable);
 static void blend_pixel(int x, int y, uint32_t c, int a);
 static double box_dist(double px, double py, double cx, double cy, double rx, double ry, double r);
-static int check_alsa(struct pollfd *pfds, int count);
 static void cleanup(void);
 static void die(const char *fmt, ...);
 static void draw(void);
@@ -55,6 +54,11 @@ static void ls_cfg(void *d, struct zwlr_layer_surface_v1 *s, uint32_t serial, ui
 static void ls_closed(void *d, struct zwlr_layer_surface_v1 *s);
 static void noop(void *d, struct wl_pointer *p, uint32_t s, uint32_t t, wl_fixed_t v);
 static int point_in_poly(double px, double py, const double pts[][2], int n);
+static int pulse_connect(void);
+static void pulse_disconnect(void);
+static int pulse_recv_packet(int fd, uint8_t *buf, size_t max_len);
+static int pulse_recv_reply(int fd, uint32_t req_tag, uint8_t *buf, size_t max_len);
+static int pulse_send_cmd(int fd, uint32_t cmd, uint32_t tag, const uint8_t *body, size_t body_len);
 static void ptr_btn(void *d, struct wl_pointer *p, uint32_t s, uint32_t t, uint32_t b, uint32_t st);
 static void ptr_enter(void *d, struct wl_pointer *p, uint32_t s, struct wl_surface *surf, wl_fixed_t sx, wl_fixed_t sy);
 static void ptr_leave(void *d, struct wl_pointer *p, uint32_t s, struct wl_surface *surf);
@@ -64,8 +68,6 @@ static void reg_glob(void *d, struct wl_registry *r, uint32_t n, const char *i, 
 static void seat_caps(void *d, struct wl_seat *s, uint32_t c);
 static void set_visibility(int v);
 static void setup(void);
-static int setup_alsa_poll(struct pollfd *pfds);
-static void setup_mixer(void);
 static void sig_handler(int sig);
 static void update_all(void);
 static int update_clock(void);
@@ -119,11 +121,11 @@ static struct wl_surface *surf;
 static struct zwlr_layer_surface_v1 *ls;
 static struct wl_buffer *buf;
 static struct wl_pointer *ptr;
-static snd_mixer_t *mixer;
-static snd_mixer_elem_t *mixer_elem;
 static void *pixel_data;
 static int timer_fd = -1;
 static int netlink_fd = -1;
+static int pulse_fd = -1;
+static uint32_t pulse_tag;
 static int cur_bright = -1;
 static int cur_vol = -1;
 static int cur_bat = -1;
@@ -184,26 +186,10 @@ box_dist(double px, double py, double cx, double cy, double rx, double ry, doubl
 	return sqrt(mx * mx + my * my) + (qx > qy ? (qx < 0.0 ? qx : 0.0) : (qy < 0.0 ? qy : 0.0)) - r;
 }
 
-static int
-check_alsa(struct pollfd *pfds, int count)
-{
-	int i;
-
-	for (i = 0; i < count; i++) {
-		if (!pfds[i].revents)
-			continue;
-		if (snd_mixer_handle_events(mixer) < 0)
-			setup_mixer();
-		return update_volume();
-	}
-	return 0;
-}
-
 static void
 cleanup(void)
 {
-	if (mixer)
-		snd_mixer_close(mixer);
+	pulse_disconnect();
 	if (timer_fd >= 0)
 		close(timer_fd);
 	if (netlink_fd >= 0)
@@ -569,7 +555,6 @@ setup(void)
 
 	signal(SIGINT, sig_handler);
 	signal(SIGTERM, sig_handler);
-	setup_mixer();
 	timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
 	memset(&sa, 0, sizeof(sa));
 	sa.nl_family = AF_NETLINK;
@@ -608,42 +593,163 @@ setup(void)
 	wl_display_roundtrip(dpy);
 }
 
-static int
-setup_alsa_poll(struct pollfd *pfds)
+static void
+pulse_disconnect(void)
 {
-	int count;
-
-	if (!mixer)
-		return 0;
-	count = snd_mixer_poll_descriptors_count(mixer);
-	if (count <= 0 || count > 5)
-		return 0;
-	snd_mixer_poll_descriptors(mixer, pfds, count);
-	return count;
+	if (pulse_fd >= 0)
+		close(pulse_fd);
+	pulse_fd = -1;
 }
 
-static void
-setup_mixer(void)
+static int
+pulse_send_cmd(int fd, uint32_t cmd, uint32_t tag, const uint8_t *body, size_t body_len)
 {
-	snd_mixer_elem_t *elem;
+	uint8_t buf[512];
+	uint32_t plen;
 
-	if (mixer)
-		snd_mixer_close(mixer);
-	mixer = NULL;
-	mixer_elem = NULL;
-	if (snd_mixer_open(&mixer, 0) < 0)
-		return;
-	if (snd_mixer_attach(mixer, alsa_device) < 0 || snd_mixer_selem_register(mixer, NULL, NULL) < 0 || snd_mixer_load(mixer) < 0) {
-		snd_mixer_close(mixer);
-		mixer = NULL;
-		return;
+	plen = 10 + body_len;
+	buf[0] = (plen >> 24) & 0xff;
+	buf[1] = (plen >> 16) & 0xff;
+	buf[2] = (plen >> 8) & 0xff;
+	buf[3] = plen & 0xff;
+	buf[4] = buf[5] = buf[6] = buf[7] = 0xff;
+	buf[8] = buf[9] = buf[10] = buf[11] = 0;
+	buf[12] = buf[13] = buf[14] = buf[15] = 0;
+	buf[16] = buf[17] = buf[18] = buf[19] = 0;
+
+	buf[20] = 'L';
+	buf[21] = (cmd >> 24) & 0xff;
+	buf[22] = (cmd >> 16) & 0xff;
+	buf[23] = (cmd >> 8) & 0xff;
+	buf[24] = cmd & 0xff;
+
+	buf[25] = 'L';
+	buf[26] = (tag >> 24) & 0xff;
+	buf[27] = (tag >> 16) & 0xff;
+	buf[28] = (tag >> 8) & 0xff;
+	buf[29] = tag & 0xff;
+
+	if (body_len > 0)
+		memcpy(&buf[30], body, body_len);
+
+	return send(fd, buf, 20 + plen, MSG_NOSIGNAL) == (ssize_t)(20 + plen) ? 0 : -1;
+}
+
+static int
+pulse_recv_packet(int fd, uint8_t *buf, size_t max_len)
+{
+	uint8_t hdr[20];
+	size_t len, off;
+	ssize_t n;
+
+	off = 0;
+	while (off < 20) {
+		if ((n = recv(fd, hdr + off, 20 - off, 0)) <= 0)
+			return -1;
+		off += n;
 	}
-	for (elem = snd_mixer_first_elem(mixer); elem; elem = snd_mixer_elem_next(elem)) {
-		if (!strcmp(snd_mixer_selem_get_name(elem), alsa_mixer)) {
-			mixer_elem = elem;
-			break;
-		}
+	len = ((size_t)hdr[0] << 24) | ((size_t)hdr[1] << 16) | ((size_t)hdr[2] << 8) | (size_t)hdr[3];
+	off = 0;
+	while (off < len) {
+		size_t to_read = len - off;
+		if (to_read > max_len - off)
+			to_read = max_len - off;
+		if ((n = recv(fd, buf + off, to_read, 0)) <= 0)
+			return -1;
+		off += n;
 	}
+	return len <= max_len ? (int)len : (int)max_len;
+}
+
+static int
+pulse_recv_reply(int fd, uint32_t req_tag, uint8_t *buf, size_t max_len)
+{
+	int len;
+	uint32_t cmd, tag;
+
+	while ((len = pulse_recv_packet(fd, buf, max_len)) >= 10) {
+		if (buf[0] != 'L' || buf[5] != 'L')
+			continue;
+		cmd = ((uint32_t)buf[1] << 24) | ((uint32_t)buf[2] << 16) | ((uint32_t)buf[3] << 8) | buf[4];
+		tag = ((uint32_t)buf[6] << 24) | ((uint32_t)buf[7] << 16) | ((uint32_t)buf[8] << 8) | buf[9];
+		if (cmd == 2 && tag == req_tag)
+			return len;
+	}
+	return -1;
+}
+
+static int
+pulse_connect(void)
+{
+	struct sockaddr_un sa;
+	uint8_t cookie[256], body[270], resp[1024];
+	const char *rundir, *home;
+	char path[256];
+	int cfd, fd;
+
+	static const uint8_t prop[] = {
+		'P', 't', 'a', 'p', 'p', 'l', 'i', 'c', 'a', 't', 'i', 'o', 'n', '.', 'n', 'a', 'm', 'e', 0,
+		'L', 0, 0, 0, 4, 'x', 0, 0, 0, 4, 'b', 'a', 'r', 0, 'N'
+	};
+	static const uint8_t sub_req[] = {
+		'L', 0, 0, 2, 0xff
+	};
+
+	pulse_disconnect();
+	rundir = getenv("XDG_RUNTIME_DIR");
+	if (!rundir)
+		rundir = "/run/user/1000";
+	if (snprintf(path, sizeof(path), "%s/pulse/native", rundir) >= (int)sizeof(sa.sun_path))
+		return -1;
+
+	fd = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (fd < 0)
+		return -1;
+	memset(&sa, 0, sizeof(sa));
+	sa.sun_family = AF_UNIX;
+	memcpy(sa.sun_path, path, strlen(path) + 1);
+	if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+		close(fd);
+		return -1;
+	}
+
+	home = getenv("HOME");
+	if (!home)
+		home = "/home/felix";
+	if ((size_t)snprintf(path, sizeof(path), "%s/.config/pulse/cookie", home) >= sizeof(path)) {
+		close(fd);
+		return -1;
+	}
+	cfd = open(path, O_RDONLY);
+	if (cfd < 0 || read(cfd, cookie, 256) != 256) {
+		if (cfd >= 0)
+			close(cfd);
+		close(fd);
+		return -1;
+	}
+	close(cfd);
+
+	body[0] = 'L';
+	body[1] = 0; body[2] = 0; body[3] = 0; body[4] = 35;
+	body[5] = 'x';
+	body[6] = 0; body[7] = 0; body[8] = 1; body[9] = 0;
+	memcpy(&body[10], cookie, 256);
+
+	if (pulse_send_cmd(fd, 8, pulse_tag, body, 266) < 0 || pulse_recv_reply(fd, pulse_tag++, resp, sizeof(resp)) < 0) {
+		close(fd);
+		return -1;
+	}
+	if (pulse_send_cmd(fd, 9, pulse_tag, prop, sizeof(prop)) < 0 || pulse_recv_reply(fd, pulse_tag++, resp, sizeof(resp)) < 0) {
+		close(fd);
+		return -1;
+	}
+	if (pulse_send_cmd(fd, 35, pulse_tag, sub_req, sizeof(sub_req)) < 0 || pulse_recv_reply(fd, pulse_tag++, resp, sizeof(resp)) < 0) {
+		close(fd);
+		return -1;
+	}
+
+	pulse_fd = fd;
+	return 0;
 }
 
 static void
@@ -716,27 +822,50 @@ update_sysfs(void)
 static int
 update_volume(void)
 {
-	long max, min, vol;
-	int muted, sw, v;
+	uint8_t resp[4096];
+	int chans, len, mute, v, v_idx;
+	uint32_t raw_vol, tag;
 
-	if (!mixer_elem) {
-		setup_mixer();
-		if (!mixer_elem)
-			return 0;
-	}
-	sw = 1;
-	vol = min = max = 0;
-	if (snd_mixer_selem_get_playback_volume_range(mixer_elem, &min, &max) < 0 || snd_mixer_selem_get_playback_volume(mixer_elem, SND_MIXER_SCHN_MONO, &vol) < 0) {
-		setup_mixer();
+	static const uint8_t sink_req[] = {
+		'L', 0xff, 0xff, 0xff, 0xff,
+		't', '@', 'D', 'E', 'F', 'A', 'U', 'L', 'T', '_', 'S', 'I', 'N', 'K', '@', 0
+	};
+
+	if (pulse_fd < 0 && pulse_connect() < 0)
+		return 0;
+	tag = pulse_tag++;
+	if (pulse_send_cmd(pulse_fd, 21, tag, sink_req, sizeof(sink_req)) < 0) {
+		pulse_disconnect();
 		return 0;
 	}
-	snd_mixer_selem_get_playback_switch(mixer_elem, SND_MIXER_SCHN_MONO, &sw);
-	muted = !sw;
-	v = max > min ? (vol - min) * 100 / (max - min) : 0;
-	if (v == cur_vol && muted == cur_mute)
+	if ((len = pulse_recv_reply(pulse_fd, tag, resp, sizeof(resp))) < 0) {
+		pulse_disconnect();
+		return 0;
+	}
+
+	v = -1;
+	mute = 0;
+	for (v_idx = 0; v_idx < len - 10; v_idx++) {
+		if (resp[v_idx] == 'v') {
+			chans = resp[v_idx + 1];
+			raw_vol = ((uint32_t)resp[v_idx + 2] << 24) |
+			          ((uint32_t)resp[v_idx + 3] << 16) |
+			          ((uint32_t)resp[v_idx + 4] << 8)  |
+			           (uint32_t)resp[v_idx + 5];
+			v = (raw_vol * 100 + 32768) / 65536;
+			if (v > 100)
+				v = 100;
+			if (v_idx + 2 + 4 * chans < len)
+				mute = (resp[v_idx + 2 + 4 * chans] == '1');
+			break;
+		}
+	}
+	if (v < 0)
+		return 0;
+	if (v == cur_vol && mute == cur_mute)
 		return 0;
 	cur_vol = v;
-	cur_mute = muted;
+	cur_mute = mute;
 	return 1;
 }
 
@@ -749,16 +878,15 @@ usage(void)
 int
 main(int argc, char **argv)
 {
-	struct pollfd pfds[8];
+	struct pollfd pfds[4];
 	uint64_t exp;
 	char nlk[512];
-	int alsa_count, dirty, nfds, opt;
+	int dirty, nfds, opt;
 
 	selected_corner = corner;
 	opt_autohide = autohide;
 	if (!opt_autohide)
 		visible = 1;
-	alsa_count = 0;
 	while ((opt = getopt(argc, argv, "c:nhv")) >= 0) {
 		switch (opt) {
 		case 'c':
@@ -791,10 +919,11 @@ main(int argc, char **argv)
 
 	while (running) {
 		dirty = 0;
-		if (!mixer_elem)
+		if (pulse_fd < 0)
 			dirty |= update_volume();
-		alsa_count = setup_alsa_poll(&pfds[3]);
-		nfds = 3 + alsa_count;
+		pfds[3].fd = pulse_fd;
+		pfds[3].events = POLLIN;
+		nfds = (pulse_fd >= 0) ? 4 : 3;
 
 		while (wl_display_prepare_read(dpy) < 0)
 			wl_display_dispatch_pending(dpy);
@@ -806,11 +935,14 @@ main(int argc, char **argv)
 			continue;
 		}
 
-		if (pfds[0].revents & (POLLIN | POLLERR | POLLHUP))
-			wl_display_read_events(dpy);
-		else
+		if (pfds[0].revents & (POLLIN | POLLERR | POLLHUP)) {
+			if (wl_display_read_events(dpy) < 0)
+				break;
+		} else {
 			wl_display_cancel_read(dpy);
-		wl_display_dispatch_pending(dpy);
+		}
+		if (wl_display_dispatch_pending(dpy) < 0)
+			break;
 
 		if (timer_fd >= 0 && (pfds[1].revents & POLLIN) && read(timer_fd, &exp, sizeof(exp)) > 0)
 			dirty |= update_clock();
@@ -818,8 +950,13 @@ main(int argc, char **argv)
 			while (recv(netlink_fd, nlk, sizeof(nlk), 0) > 0) {}
 			dirty |= update_sysfs();
 		}
-		if (alsa_count > 0)
-			dirty |= check_alsa(&pfds[3], alsa_count);
+		if (pulse_fd >= 0 && (pfds[3].revents & (POLLIN | POLLERR | POLLHUP))) {
+			if (pfds[3].revents & (POLLERR | POLLHUP)) {
+				pulse_disconnect();
+			} else {
+				dirty |= update_volume();
+			}
+		}
 		if (dirty && visible)
 			draw();
 	}
