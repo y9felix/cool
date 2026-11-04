@@ -14,6 +14,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/timerfd.h>
 #include <time.h>
 #include <unistd.h>
@@ -37,6 +38,8 @@ static void arm_timer(int enable);
 static void blend_pixel(int x, int y, uint32_t c, int a);
 static double box_dist(double px, double py, double cx, double cy, double rx, double ry, double r);
 static void cleanup(void);
+static void create_surface(void);
+static void destroy_surface(void);
 static void die(const char *fmt, ...);
 static void draw(void);
 static void draw_arc(double cx, double cy, double r, int arc, uint32_t c, double th);
@@ -65,6 +68,7 @@ static void ptr_leave(void *d, struct wl_pointer *p, uint32_t s, struct wl_surfa
 static void ptr_motion(void *d, struct wl_pointer *p, uint32_t t, wl_fixed_t sx, wl_fixed_t sy);
 static int read_sysfs(const char *base, const char *entry);
 static void reg_glob(void *d, struct wl_registry *r, uint32_t n, const char *i, uint32_t v);
+static void reg_remove(void *d, struct wl_registry *r, uint32_t n);
 static void seat_caps(void *d, struct wl_seat *s, uint32_t c);
 static void set_visibility(int v);
 static void setup(void);
@@ -110,10 +114,12 @@ static const struct wl_seat_listener seat_l = {
 	.capabilities = seat_caps
 };
 static const struct wl_registry_listener reg_l = {
-	.global = reg_glob
+	.global = reg_glob,
+	.global_remove = reg_remove
 };
 
 static struct wl_display *dpy;
+static struct wl_registry *reg;
 static struct wl_compositor *comp;
 static struct wl_shm *shm;
 static struct zwlr_layer_shell_v1 *shell;
@@ -122,6 +128,8 @@ static struct zwlr_layer_surface_v1 *ls;
 static struct wl_buffer *buf;
 static struct wl_pointer *ptr;
 static void *pixel_data;
+static uint32_t output_names[16];
+static int output_count;
 static int timer_fd = -1;
 static int netlink_fd = -1;
 static int pulse_fd = -1;
@@ -198,14 +206,41 @@ cleanup(void)
 		wl_pointer_destroy(ptr);
 	if (buf)
 		wl_buffer_destroy(buf);
-	if (ls)
-		zwlr_layer_surface_v1_destroy(ls);
-	if (surf)
-		wl_surface_destroy(surf);
+	destroy_surface();
+	if (reg)
+		wl_registry_destroy(reg);
 	if (pixel_data)
 		munmap(pixel_data, (size_t)bar_width * 4 * bar_height);
 	if (dpy)
 		wl_display_disconnect(dpy);
+}
+
+static void
+create_surface(void)
+{
+	if (ls || !comp || !shell)
+		return;
+	surf = wl_compositor_create_surface(comp);
+	ls = zwlr_layer_shell_v1_get_layer_surface(shell, surf, NULL, ZWLR_LAYER_SHELL_V1_LAYER_TOP, "bar");
+	zwlr_layer_surface_v1_add_listener(ls, &ls_l, NULL);
+	zwlr_layer_surface_v1_set_size(ls, bar_width, bar_height);
+	zwlr_layer_surface_v1_set_anchor(ls, anchors[selected_corner & 3]);
+	zwlr_layer_surface_v1_set_exclusive_zone(ls, 0);
+	wl_surface_commit(surf);
+}
+
+static void
+destroy_surface(void)
+{
+	configured = 0;
+	if (ls) {
+		zwlr_layer_surface_v1_destroy(ls);
+		ls = NULL;
+	}
+	if (surf) {
+		wl_surface_destroy(surf);
+		surf = NULL;
+	}
 }
 
 static void
@@ -234,7 +269,7 @@ draw(void)
 	uint32_t c, *p;
 	int i, icon_y, text_y, x;
 
-	if (!configured || !pixel_data)
+	if (!configured || !pixel_data || !surf || !ls)
 		return;
 	if (opt_autohide && !visible) {
 		memset(pixel_data, 0, (size_t)bar_width * 4 * bar_height);
@@ -438,6 +473,9 @@ draw_volume(int x, int y, uint32_t c)
 static void
 ls_cfg(void *d, struct zwlr_layer_surface_v1 *s, uint32_t serial, uint32_t w, uint32_t h)
 {
+	(void)d;
+	(void)w;
+	(void)h;
 	zwlr_layer_surface_v1_ack_configure(s, serial);
 	configured = 1;
 	update_input_region();
@@ -449,7 +487,9 @@ ls_cfg(void *d, struct zwlr_layer_surface_v1 *s, uint32_t serial, uint32_t w, ui
 static void
 ls_closed(void *d, struct zwlr_layer_surface_v1 *s)
 {
-	running = 0;
+	(void)d;
+	(void)s;
+	destroy_surface();
 }
 
 static void
@@ -512,6 +552,8 @@ read_sysfs(const char *base, const char *entry)
 static void
 reg_glob(void *d, struct wl_registry *r, uint32_t n, const char *i, uint32_t v)
 {
+	(void)d;
+	(void)v;
 	if (!strcmp(i, wl_compositor_interface.name))
 		comp = wl_registry_bind(r, n, &wl_compositor_interface, 1);
 	else if (!strcmp(i, wl_shm_interface.name))
@@ -520,14 +562,41 @@ reg_glob(void *d, struct wl_registry *r, uint32_t n, const char *i, uint32_t v)
 		shell = wl_registry_bind(r, n, &zwlr_layer_shell_v1_interface, 1);
 	else if (!strcmp(i, wl_seat_interface.name))
 		wl_seat_add_listener(wl_registry_bind(r, n, &wl_seat_interface, 1), &seat_l, NULL);
+	else if (!strcmp(i, wl_output_interface.name)) {
+		if (output_count < (int)(sizeof(output_names) / sizeof(output_names[0])))
+			output_names[output_count++] = n;
+		if (!ls && comp && shell)
+			create_surface();
+	}
+}
+
+static void
+reg_remove(void *d, struct wl_registry *r, uint32_t n)
+{
+	int i;
+
+	(void)d;
+	(void)r;
+	for (i = 0; i < output_count; i++) {
+		if (output_names[i] == n) {
+			output_names[i] = output_names[--output_count];
+			break;
+		}
+	}
+	if (!output_count && ls)
+		destroy_surface();
 }
 
 static void
 seat_caps(void *d, struct wl_seat *s, uint32_t c)
 {
+	(void)d;
 	if ((c & WL_SEAT_CAPABILITY_POINTER) && !ptr) {
 		ptr = wl_seat_get_pointer(s);
 		wl_pointer_add_listener(ptr, &ptr_l, NULL);
+	} else if (!(c & WL_SEAT_CAPABILITY_POINTER) && ptr) {
+		wl_pointer_destroy(ptr);
+		ptr = NULL;
 	}
 }
 
@@ -541,7 +610,8 @@ set_visibility(int v)
 	update_input_region();
 	if (v)
 		update_all();
-	draw();
+	if (surf && configured)
+		draw();
 }
 
 static void
@@ -566,7 +636,8 @@ setup(void)
 
 	if (!(dpy = wl_display_connect(NULL)))
 		die("cannot connect to wayland display");
-	wl_registry_add_listener(wl_display_get_registry(dpy), &reg_l, NULL);
+	reg = wl_display_get_registry(dpy);
+	wl_registry_add_listener(reg, &reg_l, NULL);
 	wl_display_roundtrip(dpy);
 	if (!comp || !shm || !shell)
 		die("missing wayland globals");
@@ -583,13 +654,8 @@ setup(void)
 	wl_shm_pool_destroy(pool);
 	close(fd);
 
-	surf = wl_compositor_create_surface(comp);
-	ls = zwlr_layer_shell_v1_get_layer_surface(shell, surf, NULL, ZWLR_LAYER_SHELL_V1_LAYER_TOP, "bar");
-	zwlr_layer_surface_v1_add_listener(ls, &ls_l, NULL);
-	zwlr_layer_surface_v1_set_size(ls, bar_width, bar_height);
-	zwlr_layer_surface_v1_set_anchor(ls, anchors[selected_corner & 3]);
-	zwlr_layer_surface_v1_set_exclusive_zone(ls, 0);
-	wl_surface_commit(surf);
+	if (output_count > 0)
+		create_surface();
 	wl_display_roundtrip(dpy);
 }
 
@@ -672,8 +738,8 @@ pulse_recv_reply(int fd, uint32_t req_tag, uint8_t *buf, size_t max_len)
 			continue;
 		cmd = ((uint32_t)buf[1] << 24) | ((uint32_t)buf[2] << 16) | ((uint32_t)buf[3] << 8) | buf[4];
 		tag = ((uint32_t)buf[6] << 24) | ((uint32_t)buf[7] << 16) | ((uint32_t)buf[8] << 8) | buf[9];
-		if (cmd == 2 && tag == req_tag)
-			return len;
+		if (tag == req_tag)
+			return (cmd == 2) ? len : -1;
 	}
 	return -1;
 }
@@ -682,6 +748,7 @@ static int
 pulse_connect(void)
 {
 	struct sockaddr_un sa;
+	struct timeval tv;
 	uint8_t cookie[256], body[270], resp[1024];
 	const char *rundir, *home;
 	char path[256];
@@ -705,6 +772,10 @@ pulse_connect(void)
 	fd = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (fd < 0)
 		return -1;
+	tv.tv_sec = 0;
+	tv.tv_usec = 250000;
+	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 	memset(&sa, 0, sizeof(sa));
 	sa.sun_family = AF_UNIX;
 	memcpy(sa.sun_path, path, strlen(path) + 1);
@@ -786,7 +857,7 @@ update_input_region(void)
 	struct wl_region *r;
 	int h, w, x, y;
 
-	if (!(r = wl_compositor_create_region(comp)))
+	if (!surf || !(r = wl_compositor_create_region(comp)))
 		return;
 	x = y = 0;
 	w = bar_width;
@@ -918,6 +989,8 @@ main(int argc, char **argv)
 	pfds[2].events = POLLIN;
 
 	while (running) {
+		if (!ls && output_count > 0)
+			create_surface();
 		dirty = 0;
 		if (pulse_fd < 0)
 			dirty |= update_volume();
