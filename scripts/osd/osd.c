@@ -13,6 +13,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/timerfd.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -33,6 +34,8 @@ enum {
 static void arm_timer(int seconds);
 static void blend_pixel(int x, int y, uint32_t c, int a);
 static void cleanup(void);
+static void create_surface(void);
+static void destroy_surface(void);
 static void die(const char *fmt, ...);
 static void draw(void);
 static void draw_arc(double cx, double cy, double r, int arc, uint32_t c, double th);
@@ -52,6 +55,7 @@ static int pulse_recv_reply(int fd, uint32_t req_tag, uint8_t *buf, size_t max_l
 static int pulse_send_cmd(int fd, uint32_t cmd, uint32_t tag, const uint8_t *body, size_t body_len);
 static int read_sysfs(const char *base, const char *entry);
 static void reg_glob(void *d, struct wl_registry *r, uint32_t n, const char *i, uint32_t v);
+static void reg_remove(void *d, struct wl_registry *r, uint32_t n);
 static void set_visibility(int v);
 static void setup(void);
 static void sig_handler(int sig);
@@ -85,10 +89,12 @@ static const struct zwlr_layer_surface_v1_listener ls_l = {
 	.closed = ls_closed
 };
 static const struct wl_registry_listener reg_l = {
-	.global = reg_glob
+	.global = reg_glob,
+	.global_remove = reg_remove
 };
 
 static struct wl_display *dpy;
+static struct wl_registry *reg;
 static struct wl_compositor *comp;
 static struct wl_shm *shm;
 static struct zwlr_layer_shell_v1 *shell;
@@ -96,6 +102,8 @@ static struct wl_surface *surf;
 static struct zwlr_layer_surface_v1 *ls;
 static struct wl_buffer *buf;
 static uint32_t *pixel_data;
+static uint32_t output_names[16];
+static int output_count;
 static int timer_fd = -1;
 static int netlink_fd = -1;
 static int pulse_fd = -1;
@@ -153,10 +161,9 @@ cleanup(void)
 		close(netlink_fd);
 	if (buf)
 		wl_buffer_destroy(buf);
-	if (ls)
-		zwlr_layer_surface_v1_destroy(ls);
-	if (surf)
-		wl_surface_destroy(surf);
+	destroy_surface();
+	if (reg)
+		wl_registry_destroy(reg);
 	if (shm)
 		wl_shm_destroy(shm);
 	if (shell)
@@ -166,6 +173,40 @@ cleanup(void)
 	if (dpy) {
 		wl_display_flush(dpy);
 		wl_display_disconnect(dpy);
+	}
+}
+
+static void
+create_surface(void)
+{
+	if (ls || !comp || !shell)
+		return;
+	surf = wl_compositor_create_surface(comp);
+	ls = zwlr_layer_shell_v1_get_layer_surface(shell, surf, NULL, ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY, "osd");
+	zwlr_layer_surface_v1_set_size(ls, popup_width, popup_height);
+	zwlr_layer_surface_v1_set_anchor(ls, anchors[selected_corner]);
+	zwlr_layer_surface_v1_set_margin(ls,
+		margins[selected_corner][0] * edge_margin,
+		margins[selected_corner][1] * edge_margin,
+		margins[selected_corner][2] * edge_margin,
+		margins[selected_corner][3] * edge_margin);
+	zwlr_layer_surface_v1_set_exclusive_zone(ls, -1);
+	zwlr_layer_surface_v1_add_listener(ls, &ls_l, NULL);
+	wl_surface_commit(surf);
+}
+
+static void
+destroy_surface(void)
+{
+	configured = 0;
+	visible = 0;
+	if (ls) {
+		zwlr_layer_surface_v1_destroy(ls);
+		ls = NULL;
+	}
+	if (surf) {
+		wl_surface_destroy(surf);
+		surf = NULL;
 	}
 }
 
@@ -188,7 +229,7 @@ draw(void)
 	uint32_t border_col, col;
 	int active_sq, bg_h, bg_w, bx, by, i, pct, rem, sq_x, sx, total_sq, tx, ty;
 
-	if (!configured || !visible)
+	if (!configured || !visible || !surf || !ls)
 		return;
 
 	fill(pixel_data, popup_width, popup_height, 0, 0, popup_width, popup_height, 0);
@@ -434,7 +475,7 @@ ls_closed(void *d, struct zwlr_layer_surface_v1 *s)
 {
 	(void)d;
 	(void)s;
-	running = 0;
+	destroy_surface();
 }
 
 static int
@@ -534,8 +575,8 @@ pulse_recv_reply(int fd, uint32_t req_tag, uint8_t *buf, size_t max_len)
 			continue;
 		cmd = ((uint32_t)buf[1] << 24) | ((uint32_t)buf[2] << 16) | ((uint32_t)buf[3] << 8) | buf[4];
 		tag = ((uint32_t)buf[6] << 24) | ((uint32_t)buf[7] << 16) | ((uint32_t)buf[8] << 8) | buf[9];
-		if (cmd == 2 && tag == req_tag)
-			return len;
+		if (tag == req_tag)
+			return (cmd == 2) ? len : -1;
 	}
 	return -1;
 }
@@ -544,6 +585,7 @@ static int
 pulse_connect(void)
 {
 	struct sockaddr_un sa;
+	struct timeval tv;
 	uint8_t cookie[256], body[270], resp[1024];
 	const char *rundir, *home;
 	char path[256];
@@ -567,6 +609,10 @@ pulse_connect(void)
 	fd = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (fd < 0)
 		return -1;
+	tv.tv_sec = 0;
+	tv.tv_usec = 250000;
+	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 	memset(&sa, 0, sizeof(sa));
 	sa.sun_family = AF_UNIX;
 	memcpy(sa.sun_path, path, strlen(path) + 1);
@@ -644,6 +690,29 @@ reg_glob(void *d, struct wl_registry *r, uint32_t n, const char *i, uint32_t v)
 		shm = wl_registry_bind(r, n, &wl_shm_interface, 1);
 	else if (!strcmp(i, zwlr_layer_shell_v1_interface.name))
 		shell = wl_registry_bind(r, n, &zwlr_layer_shell_v1_interface, 1);
+	else if (!strcmp(i, wl_output_interface.name)) {
+		if (output_count < (int)(sizeof(output_names) / sizeof(output_names[0])))
+			output_names[output_count++] = n;
+		if (!ls && comp && shell)
+			create_surface();
+	}
+}
+
+static void
+reg_remove(void *d, struct wl_registry *r, uint32_t n)
+{
+	int i;
+
+	(void)d;
+	(void)r;
+	for (i = 0; i < output_count; i++) {
+		if (output_names[i] == n) {
+			output_names[i] = output_names[--output_count];
+			break;
+		}
+	}
+	if (!output_count && ls)
+		destroy_surface();
 }
 
 static void
@@ -652,7 +721,7 @@ set_visibility(int v)
 	if (visible == v)
 		return;
 	visible = v;
-	if (!visible) {
+	if (!visible && surf && configured) {
 		fill(pixel_data, popup_width, popup_height, 0, 0, popup_width, popup_height, 0);
 		wl_surface_attach(surf, buf, 0, 0);
 		wl_surface_damage(surf, 0, 0, popup_width, popup_height);
@@ -664,7 +733,6 @@ static void
 setup(void)
 {
 	struct sockaddr_nl sa;
-	struct wl_registry *r;
 	struct wl_shm_pool *p;
 	char path[32];
 	int fd, sz;
@@ -674,11 +742,10 @@ setup(void)
 
 	if (!(dpy = wl_display_connect(NULL)))
 		die("failed to connect to Wayland display");
-	if (!(r = wl_display_get_registry(dpy)))
+	if (!(reg = wl_display_get_registry(dpy)))
 		die("failed to get Wayland registry");
-	wl_registry_add_listener(r, &reg_l, NULL);
+	wl_registry_add_listener(reg, &reg_l, NULL);
 	wl_display_roundtrip(dpy);
-	wl_registry_destroy(r);
 
 	if (!comp || !shm || !shell)
 		die("missing required Wayland globals");
@@ -699,18 +766,8 @@ setup(void)
 	wl_shm_pool_destroy(p);
 	close(fd);
 
-	surf = wl_compositor_create_surface(comp);
-	ls = zwlr_layer_shell_v1_get_layer_surface(shell, surf, NULL, ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY, "osd");
-	zwlr_layer_surface_v1_set_size(ls, popup_width, popup_height);
-	zwlr_layer_surface_v1_set_anchor(ls, anchors[selected_corner]);
-	zwlr_layer_surface_v1_set_margin(ls,
-		margins[selected_corner][0] * edge_margin,
-		margins[selected_corner][1] * edge_margin,
-		margins[selected_corner][2] * edge_margin,
-		margins[selected_corner][3] * edge_margin);
-	zwlr_layer_surface_v1_set_exclusive_zone(ls, -1);
-	zwlr_layer_surface_v1_add_listener(ls, &ls_l, NULL);
-	wl_surface_commit(surf);
+	if (output_count > 0)
+		create_surface();
 	wl_display_roundtrip(dpy);
 
 	if ((timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC)) < 0)
@@ -866,6 +923,8 @@ main(int argc, char **argv)
 	pfds[2].events = POLLIN;
 
 	while (running) {
+		if (!ls && output_count > 0)
+			create_surface();
 		if (!test_mode && pulse_fd < 0)
 			update_volume();
 		pfds[3].fd = pulse_fd;
