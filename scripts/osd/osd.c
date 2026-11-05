@@ -1,4 +1,4 @@
-#define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE
 
 #include <errno.h>
 #include <fcntl.h>
@@ -734,7 +734,6 @@ setup(void)
 {
 	struct sockaddr_nl sa;
 	struct wl_shm_pool *p;
-	char path[32];
 	int fd, sz;
 
 	signal(SIGTERM, sig_handler);
@@ -751,10 +750,8 @@ setup(void)
 		die("missing required Wayland globals");
 
 	sz = popup_width * popup_height * 4;
-	snprintf(path, sizeof(path), "/osd-shm-%d", getpid());
-	if ((fd = shm_open(path, O_RDWR | O_CREAT | O_EXCL, 0600)) < 0)
+	if ((fd = memfd_create("osd", MFD_CLOEXEC)) < 0)
 		die("failed to create shm file");
-	shm_unlink(path);
 	if (ftruncate(fd, sz) < 0)
 		die("failed to truncate shm");
 	pixel_data = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
@@ -773,15 +770,13 @@ setup(void)
 	if ((timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC)) < 0)
 		die("failed to create timerfd");
 
-	if ((netlink_fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_KOBJECT_UEVENT)) >= 0) {
+	if ((netlink_fd = socket(AF_NETLINK, SOCK_RAW | SOCK_NONBLOCK | SOCK_CLOEXEC, NETLINK_KOBJECT_UEVENT)) >= 0) {
 		memset(&sa, 0, sizeof(sa));
 		sa.nl_family = AF_NETLINK;
 		sa.nl_groups = 1;
 		if (bind(netlink_fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
 			close(netlink_fd);
 			netlink_fd = -1;
-		} else {
-			fcntl(netlink_fd, F_SETFL, fcntl(netlink_fd, F_GETFL, 0) | O_NONBLOCK);
 		}
 	}
 }
