@@ -1,4 +1,4 @@
-#define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -258,10 +258,8 @@ probe_device(const char *ip, int port)
 	int fd, err;
 	socklen_t len;
 
-	if ((fd = socket(AF_INET, SOCK_STREAM, 0)) < 0)
+	if ((fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0)) < 0)
 		return 0;
-	fcntl(fd, F_SETFL, O_NONBLOCK);
-	fcntl(fd, F_SETFD, FD_CLOEXEC);
 
 	memset(&addr, 0, sizeof(addr));
 	addr.sin_family = AF_INET;
@@ -364,11 +362,10 @@ connect_android(const char *target)
 	addr.sin_port = htons(ANDROID_PORT);
 	addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
-	if ((s = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+	if ((s = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)) < 0) {
 		android_retry = monoms() + 100;
 		return -1;
 	}
-	fcntl(s, F_SETFD, FD_CLOEXEC);
 
 	if (connect(s, (struct sockaddr *)&addr, sizeof(addr)) < 0)
 		goto retry;
@@ -432,10 +429,8 @@ wl_copy(const char *data, size_t len)
 	int p[2];
 	pid_t pid;
 
-	if (pipe(p) < 0)
+	if (pipe2(p, O_CLOEXEC) < 0)
 		return;
-	fcntl(p[0], F_SETFD, FD_CLOEXEC);
-	fcntl(p[1], F_SETFD, FD_CLOEXEC);
 	if ((pid = fork()) == 0) {
 		signal(SIGPIPE, SIG_DFL);
 		dup2(p[0], 0);
@@ -457,7 +452,7 @@ run_push(const char *sock_path)
 	int fd, ret;
 
 	ret = 0;
-	if ((fd = socket(AF_UNIX, SOCK_STREAM, 0)) < 0)
+	if ((fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0)) < 0)
 		return 1;
 	memset(&addr, 0, sizeof(addr));
 	addr.sun_family = AF_UNIX;
@@ -493,9 +488,8 @@ handle_push(int srv_fd)
 	int cfd;
 
 	len = 0;
-	if ((cfd = accept(srv_fd, NULL, NULL)) < 0)
+	if ((cfd = accept4(srv_fd, NULL, NULL, SOCK_CLOEXEC)) < 0)
 		return;
-	fcntl(cfd, F_SETFD, FD_CLOEXEC);
 	tv.tv_sec = 1;
 	tv.tv_usec = 0;
 	setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
@@ -605,9 +599,8 @@ main(int argc, char **argv)
 	sigaction(SIGHUP, &sa, NULL);
 
 	unlink(sock_path);
-	if ((srv_fd = socket(AF_UNIX, SOCK_STREAM, 0)) < 0)
+	if ((srv_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0)) < 0)
 		die("socket:");
-	fcntl(srv_fd, F_SETFD, FD_CLOEXEC);
 	fcntl(srv_fd, F_SETFL, O_NONBLOCK);
 	memset(&saddr, 0, sizeof(saddr));
 	saddr.sun_family = AF_UNIX;
