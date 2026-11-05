@@ -1,4 +1,5 @@
-#define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE
+
 #include <fcntl.h>
 #include <poll.h>
 #include <stdint.h>
@@ -10,25 +11,13 @@
 #include <wayland-client.h>
 
 #include "wlr-layer-shell-unstable-v1-client-protocol.h"
-#include "config.h"
+
+#ifndef VERSION
+#define VERSION "1.0"
+#endif
 
 #define N noop
 #define BIND(iface) wl_registry_bind(r, n, &(iface), 1)
-
-static void noop();
-static void ptr_btn(void *d, struct wl_pointer *p, uint32_t s, uint32_t t,
-    uint32_t b, uint32_t st);
-static void kb_key(void *d, struct wl_keyboard *k, uint32_t s, uint32_t t,
-    uint32_t key, uint32_t st);
-static void kb_map(void *d, struct wl_keyboard *k, uint32_t f, int32_t fd,
-    uint32_t sz);
-static void ls_cfg(void *d, struct zwlr_layer_surface_v1 *l, uint32_t s,
-    uint32_t w, uint32_t h);
-static void seat_caps(void *d, struct wl_seat *s, uint32_t c);
-static void reg_glob(void *d, struct wl_registry *r, uint32_t n,
-    const char *i, uint32_t v);
-
-const struct wl_interface xdg_popup_interface;
 
 static const struct { char c; uint8_t r[7]; } font[] = {
 	{ '0', { 0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E } },
@@ -59,6 +48,18 @@ static const struct { char c; uint8_t r[7]; } font[] = {
 	{ 'W', { 0x11, 0x11, 0x11, 0x15, 0x15, 0x1B, 0x11 } },
 	{ 'Y', { 0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04 } }
 };
+
+static void noop();
+static void ptr_btn(void *d, struct wl_pointer *p, uint32_t s, uint32_t t, uint32_t b, uint32_t st);
+static void kb_key(void *d, struct wl_keyboard *k, uint32_t s, uint32_t t, uint32_t key, uint32_t st);
+static void kb_map(void *d, struct wl_keyboard *k, uint32_t f, int32_t fd, uint32_t sz);
+static void ls_cfg(void *d, struct zwlr_layer_surface_v1 *l, uint32_t s, uint32_t w, uint32_t h);
+static void seat_caps(void *d, struct wl_seat *s, uint32_t c);
+static void reg_glob(void *d, struct wl_registry *r, uint32_t n, const char *i, uint32_t v);
+
+#include "config.h"
+
+const struct wl_interface xdg_popup_interface;
 
 static int scale = default_scale, grab_kbd = default_grab, test_pct = -1, done;
 static void *comp, *shm, *shell, *surf, *buf;
@@ -119,8 +120,7 @@ fill(uint32_t *p, int w, int h, int x, int y, int rw, int rh, uint32_t col)
 }
 
 static void
-draw_text(uint32_t *p, int w, int h, int cx, int y, const char *s, int sc,
-    uint32_t col)
+draw_text(uint32_t *p, int w, int h, int cx, int y, const char *s, int sc, uint32_t col)
 {
 	int x = cx - ((int)strlen(s) * 6 * sc - sc) / 2, r, c;
 	size_t i;
@@ -132,8 +132,7 @@ draw_text(uint32_t *p, int w, int h, int cx, int y, const char *s, int sc,
 			for (r = 0; r < 7; r++) {
 				for (c = 0; c < 5; c++)
 					if (font[i].r[r] & (0x10 >> c))
-						fill(p, w, h, x + c * sc,
-						    y + r * sc, sc, sc, col);
+						fill(p, w, h, x + c * sc, y + r * sc, sc, sc, col);
 			}
 			break;
 		}
@@ -149,25 +148,21 @@ render(uint32_t *p, int w, int h, int cap, int level)
 
 	fill(p, w, h, 0, 0, w, h, col);
 	fill(p, w, h, b, b, w - 2 * b, h - 2 * b, color_bg);
-	draw_text(p, w, h, cx, 20 * scale, c ? msg_critical : msg_low,
-	    4 * scale, color_text);
+	draw_text(p, w, h, cx, 20 * scale, c ? msg_critical : msg_low, 4 * scale, color_text);
 	snprintf(pct, sizeof(pct), "%d%%", cap);
 	draw_text(p, w, h, cx, 62 * scale, pct, 8 * scale, col);
-	draw_text(p, w, h, cx, 132 * scale, msg_action, 3 * scale,
-	    color_text);
+	draw_text(p, w, h, cx, 132 * scale, msg_action, 3 * scale, color_text);
 }
 
 static void
-ptr_btn(void *d, struct wl_pointer *p, uint32_t s, uint32_t t, uint32_t b,
-    uint32_t st)
+ptr_btn(void *d, struct wl_pointer *p, uint32_t s, uint32_t t, uint32_t b, uint32_t st)
 {
 	if (st)
 		done = 1;
 }
 
 static void
-kb_key(void *d, struct wl_keyboard *k, uint32_t s, uint32_t t, uint32_t key,
-    uint32_t st)
+kb_key(void *d, struct wl_keyboard *k, uint32_t s, uint32_t t, uint32_t key, uint32_t st)
 {
 	if (st)
 		done = 1;
@@ -180,8 +175,7 @@ kb_map(void *d, struct wl_keyboard *k, uint32_t f, int32_t fd, uint32_t sz)
 }
 
 static void
-ls_cfg(void *d, struct zwlr_layer_surface_v1 *l, uint32_t s, uint32_t w,
-    uint32_t h)
+ls_cfg(void *d, struct zwlr_layer_surface_v1 *l, uint32_t s, uint32_t w, uint32_t h)
 {
 	zwlr_layer_surface_v1_ack_configure(l, s);
 	wl_surface_attach(surf, buf, 0, 0);
@@ -229,29 +223,24 @@ show_popup(int cap, int level)
 	wl_display_roundtrip(dpy);
 	if (!comp || !shm || !shell)
 		goto out;
-	if ((fd = shm_open("/lowbat", O_CREAT | O_EXCL | O_RDWR, 0600)) < 0)
+	if ((fd = memfd_create("lowbat", MFD_CLOEXEC)) < 0)
 		goto out;
-	shm_unlink("/lowbat");
-	if (ftruncate(fd, sz) < 0 || (px = mmap(NULL, sz, PROT_READ |
-	    PROT_WRITE, MAP_SHARED, fd, 0)) == MAP_FAILED) {
+	if (ftruncate(fd, sz) < 0 || (px = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0)) == MAP_FAILED) {
 		close(fd);
 		goto out;
 	}
 	render(px, w, h, cap, level);
 	pool = wl_shm_create_pool(shm, fd, sz);
-	buf = wl_shm_pool_create_buffer(pool, 0, w, h, w * 4,
-	    WL_SHM_FORMAT_ARGB8888);
+	buf = wl_shm_pool_create_buffer(pool, 0, w, h, w * 4, WL_SHM_FORMAT_ARGB8888);
 	wl_shm_pool_destroy(pool);
 	close(fd);
 	surf = wl_compositor_create_surface(comp);
-	ls = zwlr_layer_shell_v1_get_layer_surface(shell, surf, NULL,
-	    ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY, "lowbat");
+	ls = zwlr_layer_shell_v1_get_layer_surface(shell, surf, NULL, ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY, "lowbat");
 	zwlr_layer_surface_v1_add_listener(ls, &ls_l, NULL);
 	zwlr_layer_surface_v1_set_size(ls, w, h);
 	zwlr_layer_surface_v1_set_exclusive_zone(ls, -1);
 	if (grab_kbd)
-		zwlr_layer_surface_v1_set_keyboard_interactivity(ls,
-		    ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_EXCLUSIVE);
+		zwlr_layer_surface_v1_set_keyboard_interactivity(ls, ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_EXCLUSIVE);
 	wl_surface_commit(surf);
 	pfd = (struct pollfd){ wl_display_get_fd(dpy), POLLIN, 0 };
 	while (!done) {
@@ -302,12 +291,10 @@ main(int argc, char **argv)
 		}
 	}
 	if (test_pct >= 0)
-		return show_popup(test_pct, test_pct <= level_crit ?
-		    level_crit : level_low) < 0;
+		return show_popup(test_pct, test_pct <= level_crit ? level_crit : level_low) < 0;
 	for (;;) {
 		if (!battery_state(&cap, &dis)) {
-			want = cap <= level_crit ? level_crit :
-			    cap <= level_low ? level_low : 0;
+			want = cap <= level_crit ? level_crit : cap <= level_low ? level_low : 0;
 			if (!dis)
 				shown = 101;
 			else if (want && want < shown && !show_popup(cap, want))
