@@ -5,6 +5,6 @@ MANPREFIX = $(PREFIX)/share/man
 CC = cc
 WAYLAND_SCANNER = wayland-scanner
 
-CPPFLAGS = -D_POSIX_C_SOURCE=200809L -DVERSION=\"$(VERSION)\"
+CPPFLAGS = -DVERSION=\"$(VERSION)\"
 CFLAGS = -std=c99 -pedantic -Wall -Wextra -Werror -Wno-unused-parameter -O2
 LDFLAGS = -s -lwayland-client
