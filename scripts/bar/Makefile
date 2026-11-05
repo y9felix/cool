@@ -1,31 +1,38 @@
-.POSIX:
-
 include config.mk
 
-SRC = bar.c wlr-layer-shell-unstable-v1-protocol.c
+PROTO_XML = protocols/wlr-layer-shell-unstable-v1.xml
+PROTO_H = wlr-layer-shell-unstable-v1-client-protocol.h
+PROTO_C = wlr-layer-shell-unstable-v1-protocol.c
+
+SRC = bar.c $(PROTO_C)
 OBJ = $(SRC:.c=.o)
 
 all: bar
 
-$(OBJ): config.h config.mk font.h wlr-layer-shell-unstable-v1-client-protocol.h
+$(OBJ): config.h config.mk font.h $(PROTO_H)
 
 config.h:
 	cp config.def.h $@
+	chmod 644 $@
 
-wlr-layer-shell-unstable-v1-client-protocol.h: protocols/wlr-layer-shell-unstable-v1.xml
+$(PROTO_H): $(PROTO_XML)
 	$(WAYLAND_SCANNER) client-header $< $@
+	chmod 644 $@
 
-wlr-layer-shell-unstable-v1-protocol.c: protocols/wlr-layer-shell-unstable-v1.xml
+$(PROTO_C): $(PROTO_XML)
 	$(WAYLAND_SCANNER) private-code $< $@
+	chmod 644 $@
 
 .c.o:
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $<
+	chmod 644 $@
 
 bar: $(OBJ)
 	$(CC) $(CFLAGS) -o $@ $(OBJ) $(LDFLAGS)
+	chmod 755 $@
 
 clean:
-	rm -f bar $(OBJ) wlr-layer-shell-unstable-v1-client-protocol.h wlr-layer-shell-unstable-v1-protocol.c
+	rm -f bar $(OBJ) config.h $(PROTO_H) $(PROTO_C)
 
 install: all
 	mkdir -p $(DESTDIR)$(PREFIX)/bin
