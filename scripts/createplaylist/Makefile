@@ -1,5 +1,3 @@
-.POSIX:
-
 CC = cc
 CFLAGS = -std=c99 -pedantic -Wall -Wextra -Werror -O2
 LDFLAGS = -s
