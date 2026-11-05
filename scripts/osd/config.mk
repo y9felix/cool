@@ -1,10 +1,11 @@
 VERSION = 1.0
 PREFIX = /usr/local
-MANPREFIX = $(PREFIX)/share/man
 
-CC = cc
+CC = ccache gcc
 WAYLAND_SCANNER = wayland-scanner
 
-CPPFLAGS = -DVERSION=\"$(VERSION)\"
-CFLAGS = -std=c99 -pedantic -Wall -Wextra -Werror -Wno-unused-parameter -O2
-LDFLAGS = -s -lwayland-client
+PKGS = wayland-client
+
+CPPFLAGS = -DVERSION=\"$(VERSION)\" $$(pkg-config --cflags $(PKGS))
+CFLAGS = -std=c99 -pedantic -Wall -Wextra -Werror -Wno-unused-parameter -O2 -march=skylake -fuse-ld=mold
+LDFLAGS = -s $$(pkg-config --libs $(PKGS)) -lm
