@@ -1,4 +1,4 @@
-#define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE
 
 #include <errno.h>
 #include <limits.h>
@@ -281,7 +281,7 @@ process_file(const char *path)
 	const char *base, *dot;
 	size_t blen;
 
-	if (!(f = fopen(path, "rb"))) {
+	if (!(f = fopen(path, "rbe"))) {
 		fprintf(stderr, "%s: %s: %s\n", argv0, path, strerror(errno));
 		return 1;
 	}
